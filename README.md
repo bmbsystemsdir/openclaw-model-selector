@@ -1,38 +1,84 @@
 # openclaw-model-selector
 
-Automatic per-turn model selection for OpenClaw.
+Smart model routing plugin for OpenClaw. Saves tokens by defaulting to cheap models and only switching to expensive ones when needed — with your approval.
 
-## What it does
-- Classifies the latest user message as **simple**, **moderate**, **complex**, or **coding**.
-- When the selected model changes, it injects instructions via `before_agent_start` so the agent:
-  1) Announces the switch (optional)
-  2) Calls `session_status` to set the **per-session model override** for subsequent turns
+## How It Works
 
-> Note: OpenClaw plugins cannot directly swap the model *mid-turn* (the LLM is already running). This plugin makes the switch take effect immediately for the **next** turn (and any long-running follow-ups), which is where most token savings come from.
+1. **Default: Gemini Flash** — All conversations start here
+2. **Task detected** → Suggests appropriate model, asks clarifying questions (stays on Flash)
+3. **You approve** → Switches to suggested model and executes
+4. **Bead closes** → Auto-returns to Flash
 
-## Config (example)
+## Installation
+
+### Option 1: Clone from GitHub
+```bash
+# Clone to your extensions directory
+git clone https://github.com/bmbsystemsdir/openclaw-model-selector.git ~/.openclaw/extensions/openclaw-model-selector
+
+# Enable the plugin
+openclaw plugins enable openclaw-model-selector
+```
+
+### Option 2: Install via OpenClaw CLI
+```bash
+openclaw plugins install --link https://github.com/bmbsystemsdir/openclaw-model-selector.git
+openclaw plugins enable openclaw-model-selector
+```
+
+Then restart the gateway:
+```bash
+openclaw gateway restart
+```
+
+## Configuration
+
+Add to your `~/.openclaw/openclaw.json` under `plugins.entries`:
+
 ```json
-{
+"openclaw-model-selector": {
   "enabled": true,
-  "announceSwitch": true,
-  "models": {
-    "simple": "gemini-flash",
-    "moderate": "sonnet-4-5",
-    "complex": "opus",
-    "coding": "gpt"
+  "config": {
+    "enabled": true,
+    "announceSwitch": true,
+    "announceSuggestion": true,
+    "defaultModel": "gemini-flash",
+    "models": {
+      "simple": ["gemini-flash", "sonnet-4-5"],
+      "planning": ["gemini-pro", "opus"],
+      "complex": ["opus", "gpt"],
+      "coding": ["gpt", "gemini-pro"]
+    }
   }
 }
 ```
 
-## Heuristics (default)
-- **coding**: mentions code-related terms or includes code fences
-- **complex**: mentions orchestration/architecture/build/debug/multi-step
-- else **simple**
+### Model Categories
 
-You can add forced keyword lists with:
-- `rules.forceComplexKeywords`
-- `rules.forceCodingKeywords`
+| Category | Use Case | Default Models |
+|----------|----------|----------------|
+| `simple` | Chat, Q&A, clarifications | flash → sonnet |
+| `planning` | Design, research, strategy | pro → opus |
+| `complex` | Multi-agent orchestration | opus → gpt |
+| `coding` | Code writing, debugging | gpt → pro |
 
-## Install
-Add to your `openclaw.json` under `plugins.entries` pointing at the local folder or package name.
+### Approval Triggers
 
+The plugin recognizes these phrases as approval to switch:
+- "go ahead", "proceed", "do it", "green light"
+- "approved", "yes", "looks good", "lgtm"
+- "ship it", "build it", "execute", "start"
+
+### Override Triggers
+
+Stay on Flash even when a switch is suggested:
+- "stick with flash", "stay on flash", "use flash"
+- "no switch", "don't switch", "flash is fine"
+
+## Beads Integration
+
+When you close a bead (`bd close`), the plugin automatically returns to Flash. This creates a "cost container" — expensive tokens only used while work is active.
+
+## License
+
+MIT
