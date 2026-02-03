@@ -1,0 +1,71 @@
+{
+  "id": "openclaw-model-selector",
+  "kind": "extension",
+  "uiHints": {
+    "enabled": {
+      "label": "Enabled",
+      "help": "Enable/disable automatic model selection"
+    },
+    "announceSwitch": {
+      "label": "Announce Switch",
+      "help": "Announce when switching models"
+    },
+    "announceSuggestion": {
+      "label": "Announce Suggestion",
+      "help": "Announce model suggestions before approval"
+    },
+    "defaultModel": {
+      "label": "Default Model",
+      "placeholder": "gemini-flash",
+      "help": "The default model for all conversations (returns here after task completion)"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "announceSwitch": { "type": "boolean" },
+      "announceSuggestion": { "type": "boolean" },
+      "defaultModel": { "type": "string" },
+      "models": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "simple": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "planning": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "complex": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "coding": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          }
+        }
+      },
+      "approvalTriggers": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "overrideTriggers": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    }
+  }
+}
