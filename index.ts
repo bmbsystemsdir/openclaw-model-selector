@@ -38,6 +38,7 @@ interface ModelSelectorConfig {
   announceSwitch?: boolean;
   announceSuggestion?: boolean;
   defaultModel?: string;
+  collaborationAutoSwitch?: boolean;
   models?: {
     simple?: string[];
     planning?: string[];
@@ -60,6 +61,7 @@ interface SessionState {
   pendingApproval: boolean;
   activeBeadId?: string;
   lastAnnouncedModel?: string;
+  lastCheckedMessageId?: string;
 }
 
 // ============================================================================
@@ -71,6 +73,7 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   announceSwitch: true,
   announceSuggestion: true,
   defaultModel: "gemini-flash",
+  collaborationAutoSwitch: true,
   models: {
     simple: ["gemini-flash", "sonnet-4-5", "haiku-4-5"],
     planning: ["gemini-pro", "opus"],
@@ -116,6 +119,8 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   },
   fallbackChain: ["sonnet-4-5", "haiku-4-5", "gemini-flash"],
 };
+
+const COLLABORATION_CHANNEL_ID = "1468402814106468402";
 
 // ============================================================================
 // Classification
@@ -182,6 +187,31 @@ const PLANNING_SIGNALS = [
   "refine",
   "optimize",
 ];
+
+const RATE_LIMIT_SIGNALS = [
+  "quota",
+  "insufficient_quota",
+  "capacity",
+  "rate limit",
+  "429",
+  "exhausted",
+  "resource_exhausted",
+  "overloaded",
+  "limit reached",
+];
+
+function isRateLimitError(error: any): boolean {
+  if (!error) return false;
+  const errorStr = typeof error === "string" ? error.toLowerCase() : JSON.stringify(error).toLowerCase();
+  
+  // Check for 429 status code
+  if (error.status === 429 || error.statusCode === 429 || error.code === 429 || errorStr.includes("429")) {
+    return true;
+  }
+  
+  // Check for fuzzy match strings
+  return RATE_LIMIT_SIGNALS.some(signal => errorStr.includes(signal));
+}
 
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
@@ -539,6 +569,19 @@ const plugin = {
           return;
         }
 
+        // COLLABORATION AUTO-SWITCH:
+        // If in the memory-audit-shared channel and collabAutoSwitch is enabled,
+        // switch immediately without waiting for approval.
+        if (
+          cfg.collaborationAutoSwitch &&
+          sessionKey.includes(COLLABORATION_CHANNEL_ID)
+        ) {
+          api.logger.info(`[model-selector] Collab auto-switch: ${category} → ${suggestedModel}`);
+          const injection = buildSwitchInjection(suggestedModel);
+          state.currentModel = suggestedModel;
+          return { prependContext: injection };
+        }
+
         api.logger.info(
           `[model-selector] Task detected: ${category} — suggesting ${suggestedModel}${inCollabMode ? " (collab mode)" : ""}`,
         );
@@ -558,7 +601,7 @@ const plugin = {
     );
 
     // ========================================================================
-    // Hook: after_tool_call (detect bead close + rate limits)
+    // Hook: after_tool_call (detect bead close + error monitoring)
     // ========================================================================
     api.on(
       "after_tool_call",
@@ -566,42 +609,33 @@ const plugin = {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey, defaultModel);
 
-        // Check if this was a beads_close call
-        if (event.toolName === "beads_close") {
-          // If we're not on the default model, queue a return
-          if (state.currentModel !== defaultModel) {
-            api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
-            state.currentModel = defaultModel;
-            state.lastAnnouncedModel = undefined;
-          }
-          return;
-        }
-
-        // Check for rate limit errors in tool results
-        if (event.toolName === "session_status" && event.result) {
-          const resultStr = typeof event.result === "string" ? event.result : JSON.stringify(event.result);
+        // ERROR MONITORING: Fallback on rate limit / capacity errors
+        if (event.error && isRateLimitError(event.error)) {
+          const category = state.suggestedCategory ?? "complex";
+          const models = cfg.models?.[category] ?? DEFAULT_CONFIG.models[category];
           
-          // Detect rate limit patterns
-          if (
-            resultStr.includes("rate limit") ||
-            resultStr.includes("429") ||
-            resultStr.includes("quota exceeded") ||
-            resultStr.includes("capacity")
-          ) {
-            api.logger.info(`[model-selector] Rate limit detected on ${state.currentModel}`);
-            
-            // Find next model in fallback chain
-            const currentIdx = fallbackChain.indexOf(state.currentModel);
-            const fallbackModel = currentIdx >= 0 && currentIdx < fallbackChain.length - 1
-              ? fallbackChain[currentIdx + 1]
-              : fallbackChain[0];
-            
-            if (fallbackModel !== state.currentModel) {
-              api.logger.info(`[model-selector] Falling back to ${fallbackModel}`);
-              // Note: Can't inject mid-turn, but log for awareness
-              // Agent should handle fallback via the error message
+          if (Array.isArray(models) && models.length > 1) {
+            const nextIndex = models.indexOf(state.currentModel) + 1;
+            if (nextIndex > 0 && nextIndex < models.length) {
+              const fallbackModel = models[nextIndex];
+              api.logger.warn(`[model-selector] Rate limit detected. Falling back: ${state.currentModel} → ${fallbackModel}`);
+              state.currentModel = fallbackModel;
+              
+              return { 
+                prependContext: `MODEL ROUTING (plugin-injected):\nRate limit/capacity error detected for ${event.toolName}.\nAuto-switching to fallback model: ${fallbackModel}.\n\nPlease retry the previous tool call.` 
+              };
             }
           }
+        }
+
+        // Check if this was a beads_close call
+        if (event.toolName !== "beads_close") return;
+
+        // If we're not on the default model, queue a return
+        if (state.currentModel !== defaultModel) {
+          api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
+          state.currentModel = defaultModel;
+          state.lastAnnouncedModel = undefined;
         }
       },
       { priority: 50 },
