@@ -73,7 +73,7 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   announceSwitch: true,
   announceSuggestion: true,
   defaultModel: "gemini-flash",
-  collaborationAutoSwitch: true,
+  collaborationAutoSwitch: false,
   models: {
     simple: ["gemini-flash", "sonnet-4-5", "haiku-4-5"],
     planning: ["gemini-pro", "opus"],
@@ -119,12 +119,6 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   },
   fallbackChain: ["sonnet-4-5", "haiku-4-5", "gemini-flash"],
 };
-
-const COLLABORATION_CHANNEL_ID = "1468402814106468402";
-
-// ============================================================================
-// Classification
-// ============================================================================
 
 const CODING_SIGNALS = [
   "```",
@@ -301,9 +295,11 @@ function extractAnnouncedModel(text: string): string | null {
   return null;
 }
 
-function isInCollaborationChannel(sessionKey: string, cfg: ModelSelectorConfig): boolean {
-  if (!cfg.collaborationChannel) return false;
-  return sessionKey.includes(cfg.collaborationChannel);
+  // also update comment for portability
+  if (cfg.collaborationChannel && sessionKey.includes(cfg.collaborationChannel)) {
+    return true;
+  }
+  return false;
 }
 
 function scanForOtherAgentModel(
@@ -574,7 +570,7 @@ const plugin = {
         // switch immediately without waiting for approval.
         if (
           cfg.collaborationAutoSwitch &&
-          sessionKey.includes(COLLABORATION_CHANNEL_ID)
+          sessionKey.includes(cfg.collaborationChannel || "NEVER_MATCH")
         ) {
           api.logger.info(`[model-selector] Collab auto-switch: ${category} → ${suggestedModel}`);
           const injection = buildSwitchInjection(suggestedModel);
