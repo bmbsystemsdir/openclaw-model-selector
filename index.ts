@@ -34,6 +34,7 @@ interface ModelSelectorConfig {
   announceSwitch?: boolean;
   announceSuggestion?: boolean;
   defaultModel?: string;
+  collaborationAutoSwitch?: boolean;
   models?: {
     simple?: string[];
     planning?: string[];
@@ -50,6 +51,7 @@ interface SessionState {
   suggestedCategory?: TaskCategory;
   pendingApproval: boolean;
   activeBeadId?: string;
+  lastCheckedMessageId?: string;
 }
 
 // ============================================================================
@@ -61,6 +63,7 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   announceSwitch: true,
   announceSuggestion: true,
   defaultModel: "gemini-flash",
+  collaborationAutoSwitch: true,
   models: {
     simple: ["gemini-flash", "sonnet-4-5"],
     planning: ["gemini-pro", "opus"],
@@ -95,6 +98,8 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
     "don't switch",
   ],
 };
+
+const COLLABORATION_CHANNEL_ID = "1468402814106468402";
 
 // ============================================================================
 // Classification
@@ -155,6 +160,31 @@ const PLANNING_SIGNALS = [
   "spec",
   "requirements",
 ];
+
+const RATE_LIMIT_SIGNALS = [
+  "quota",
+  "insufficient_quota",
+  "capacity",
+  "rate limit",
+  "429",
+  "exhausted",
+  "resource_exhausted",
+  "overloaded",
+  "limit reached",
+];
+
+function isRateLimitError(error: any): boolean {
+  if (!error) return false;
+  const errorStr = typeof error === "string" ? error.toLowerCase() : JSON.stringify(error).toLowerCase();
+  
+  // Check for 429 status code
+  if (error.status === 429 || error.statusCode === 429 || error.code === 429 || errorStr.includes("429")) {
+    return true;
+  }
+  
+  // Check for fuzzy match strings
+  return RATE_LIMIT_SIGNALS.some(signal => errorStr.includes(signal));
+}
 
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
@@ -333,12 +363,25 @@ const plugin = {
           return;
         }
 
-        // Task detected — suggest model but don't switch yet
+        // Task detected — suggest model
         const suggestedModel = getPrimaryModel(category, cfg);
 
         // Don't re-suggest if already on that model or already pending
         if (state.currentModel === suggestedModel || state.pendingApproval) {
           return;
+        }
+
+        // COLLABORATION AUTO-SWITCH:
+        // If in the memory-audit-shared channel and collabAutoSwitch is enabled,
+        // switch immediately without waiting for approval.
+        if (
+          cfg.collaborationAutoSwitch &&
+          sessionKey.includes(COLLABORATION_CHANNEL_ID)
+        ) {
+          api.logger.info(`[model-selector] Collab auto-switch: ${category} → ${suggestedModel}`);
+          const injection = buildSwitchInjection(suggestedModel);
+          state.currentModel = suggestedModel;
+          return { prependContext: injection };
         }
 
         api.logger.info(
@@ -356,23 +399,40 @@ const plugin = {
     );
 
     // ========================================================================
-    // Hook: after_tool_call (detect bead close)
+    // Hook: after_tool_call (detect bead close + error monitoring)
     // ========================================================================
     api.on(
       "after_tool_call",
       async (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => {
-        // Check if this was a beads_close call
-        if (event.toolName !== "beads_close") return;
-
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey, defaultModel);
+
+        // ERROR MONITORING: Fallback on rate limit / capacity errors
+        if (event.error && isRateLimitError(event.error)) {
+          const category = state.suggestedCategory ?? "complex";
+          const models = cfg.models?.[category] ?? DEFAULT_CONFIG.models[category];
+          
+          if (Array.isArray(models) && models.length > 1) {
+            const nextIndex = models.indexOf(state.currentModel) + 1;
+            if (nextIndex > 0 && nextIndex < models.length) {
+              const fallbackModel = models[nextIndex];
+              api.logger.warn(`[model-selector] Rate limit detected. Falling back: ${state.currentModel} → ${fallbackModel}`);
+              state.currentModel = fallbackModel;
+              
+              return { 
+                prependContext: `MODEL ROUTING (plugin-injected):\nRate limit/capacity error detected for ${event.toolName}.\nAuto-switching to fallback model: ${fallbackModel}.\n\nPlease retry the previous tool call.` 
+              };
+            }
+          }
+        }
+
+        // Check if this was a beads_close call
+        if (event.toolName !== "beads_close") return;
 
         // If we're not on the default model, queue a return
         if (state.currentModel !== defaultModel) {
           api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
           state.currentModel = defaultModel;
-          // Note: We can't inject mid-turn, but the next turn will be on Flash
-          // The agent should announce the return manually after closing the bead
         }
       },
       { priority: 50 },
