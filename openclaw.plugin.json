@@ -1,23 +1,28 @@
 {
   "id": "openclaw-model-selector",
   "kind": "extension",
+  "version": "4.0.0",
   "uiHints": {
     "enabled": {
       "label": "Enabled",
       "help": "Enable/disable automatic model selection"
     },
-    "announceSwitch": {
-      "label": "Announce Switch",
-      "help": "Announce when switching models"
-    },
-    "announceSuggestion": {
-      "label": "Announce Suggestion",
-      "help": "Announce model suggestions before approval"
-    },
     "defaultModel": {
       "label": "Default Model",
       "placeholder": "gemini-flash",
-      "help": "The default model for all conversations (returns here after task completion)"
+      "help": "The default model for all conversations"
+    },
+    "collaborationChannel": {
+      "label": "Collaboration Channel ID",
+      "help": "Discord channel ID where collaboration auto-switch is enabled"
+    },
+    "collaborationAutoSwitch": {
+      "label": "Collaboration Auto-Switch",
+      "help": "Automatically switch to complement model in collaboration channel"
+    },
+    "agentId": {
+      "label": "Agent ID",
+      "help": "This agent's identifier (to avoid detecting own model announcements)"
     }
   },
   "configSchema": {
@@ -25,9 +30,14 @@
     "additionalProperties": true,
     "properties": {
       "enabled": { "type": "boolean" },
-      "announceSwitch": { "type": "boolean" },
-      "announceSuggestion": { "type": "boolean" },
       "defaultModel": { "type": "string" },
+      "collaborationChannel": { "type": "string" },
+      "collaborationAutoSwitch": { "type": "boolean" },
+      "agentId": { "type": "string" },
+      "modelComplements": {
+        "type": "object",
+        "additionalProperties": { "type": "string" }
+      },
       "models": {
         "type": "object",
         "additionalProperties": true,
