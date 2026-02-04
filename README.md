@@ -28,9 +28,9 @@ In your `openclaw.json`:
     "openclaw-model-selector": {
       "enabled": true,
       "defaultModel": "gemini-flash",
-      "collaborationChannel": "1468402814106468402",
+      "collaborationChannel": "YOUR_CHANNEL_ID",
       "collaborationAutoSwitch": true,
-      "agentId": "steve",
+      "agentId": "your-agent-name",
       "modelComplements": {
         "opus": "gemini-pro",
         "gemini-pro": "opus",
