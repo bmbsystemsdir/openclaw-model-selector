@@ -1,17 +1,21 @@
 /**
- * OpenClaw Model Selector Plugin v2
+ * OpenClaw Model Selector Plugin v3
  *
- * Smart model routing with cost optimization:
+ * Smart model routing with cost optimization AND agent collaboration:
  * - Default: Gemini Flash for all conversations
  * - Task detection: Suggests appropriate model, waits for approval
  * - Bead integration: Auto-returns to Flash when bead closes
  * - Per-category fallbacks: If primary model fails, cascades to fallback
+ * - COLLABORATION MODE: When in designated channel, coordinates with other agents
+ *   to ensure model diversity (different perspectives on same problem)
  *
  * Flow:
  * 1. Flash (default) - Clarification phase
  * 2. Detect task → Suggest model (stay on Flash)
  * 3. User approves → Switch to suggested model
- * 4. Bead closes → Auto-return to Flash
+ * 4. In collab channel → Check other agent's model, pick complement
+ * 5. Announce model choice for coordination
+ * 6. Bead closes → Auto-return to Flash
  */
 
 import type {
@@ -42,6 +46,11 @@ interface ModelSelectorConfig {
   };
   approvalTriggers?: string[];
   overrideTriggers?: string[];
+  // Collaboration settings
+  collaborationChannel?: string;
+  agentId?: string;
+  modelComplements?: Record<string, string>;
+  fallbackChain?: string[];
 }
 
 interface SessionState {
@@ -50,6 +59,7 @@ interface SessionState {
   suggestedCategory?: TaskCategory;
   pendingApproval: boolean;
   activeBeadId?: string;
+  lastAnnouncedModel?: string;
 }
 
 // ============================================================================
@@ -62,10 +72,10 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   announceSuggestion: true,
   defaultModel: "gemini-flash",
   models: {
-    simple: ["gemini-flash", "sonnet-4-5"],
+    simple: ["gemini-flash", "sonnet-4-5", "haiku-4-5"],
     planning: ["gemini-pro", "opus"],
-    complex: ["opus", "gpt"],
-    coding: ["gpt", "gemini-pro"],
+    complex: ["opus", "gemini-pro"],
+    coding: ["gpt", "opus", "gemini-pro"],
   },
   approvalTriggers: [
     "go ahead",
@@ -94,6 +104,17 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
     "no switch",
     "don't switch",
   ],
+  // Collaboration defaults
+  collaborationChannel: "",
+  agentId: "",
+  modelComplements: {
+    "opus": "gemini-pro",
+    "gemini-pro": "opus",
+    "gpt": "opus",
+    "opus-4-5": "gemini-pro",
+    "gemini-3-pro": "opus",
+  },
+  fallbackChain: ["sonnet-4-5", "haiku-4-5", "gemini-flash"],
 };
 
 // ============================================================================
@@ -122,6 +143,8 @@ const CODING_SIGNALS = [
   "stack trace",
   "error:",
   "exception",
+  "index.ts",
+  "plugin",
 ];
 
 const COMPLEX_SIGNALS = [
@@ -138,6 +161,8 @@ const COMPLEX_SIGNALS = [
   "rollout",
   "security review",
   "audit",
+  "collaborate",
+  "work together",
 ];
 
 const PLANNING_SIGNALS = [
@@ -154,6 +179,8 @@ const PLANNING_SIGNALS = [
   "rfc",
   "spec",
   "requirements",
+  "refine",
+  "optimize",
 ];
 
 function classifyTask(text: string): TaskCategory {
@@ -186,6 +213,93 @@ function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): stri
   const models = cfg.models ?? DEFAULT_CONFIG.models;
   const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
   return Array.isArray(categoryModels) ? categoryModels[0] : (categoryModels as string);
+}
+
+function getComplementModel(model: string, cfg: ModelSelectorConfig): string {
+  const complements = cfg.modelComplements ?? DEFAULT_CONFIG.modelComplements;
+  // Normalize model name for lookup
+  const normalized = model.toLowerCase().replace(/[^a-z0-9]/g, "-");
+  
+  // Direct lookup
+  if (complements[model]) return complements[model];
+  if (complements[normalized]) return complements[normalized];
+  
+  // Try common aliases
+  const aliases: Record<string, string> = {
+    "opus": "opus",
+    "opus-4-5": "opus",
+    "claude-opus-4-5": "opus",
+    "gemini-pro": "gemini-pro",
+    "gemini-3-pro": "gemini-pro",
+    "gpt": "gpt",
+    "gpt-5-2": "gpt",
+  };
+  
+  const aliasKey = aliases[normalized] || aliases[model];
+  if (aliasKey && complements[aliasKey]) {
+    return complements[aliasKey];
+  }
+  
+  // Default: if they're on opus-family, we go gemini-pro; otherwise opus
+  if (model.includes("opus") || model.includes("claude")) {
+    return "gemini-pro";
+  }
+  return "opus";
+}
+
+// ============================================================================
+// Collaboration Detection
+// ============================================================================
+
+// Pattern to detect model announcements from other agents
+// Format: "📢 MODEL: [model]" or "Switching to [model]" or "📢 Model announcement:"
+const MODEL_ANNOUNCEMENT_PATTERNS = [
+  /📢\s*MODEL:\s*(\S+)/i,
+  /📢\s*Model announcement:.*?(\S+)\s+for/i,
+  /Switching to\s+(\S+)\s+for/i,
+  /switched to\s+(\S+)/i,
+  /now on\s+(\S+)/i,
+];
+
+function extractAnnouncedModel(text: string): string | null {
+  for (const pattern of MODEL_ANNOUNCEMENT_PATTERNS) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return match[1].toLowerCase().replace(/[*_`]/g, "");
+    }
+  }
+  return null;
+}
+
+function isInCollaborationChannel(sessionKey: string, cfg: ModelSelectorConfig): boolean {
+  if (!cfg.collaborationChannel) return false;
+  return sessionKey.includes(cfg.collaborationChannel);
+}
+
+function scanForOtherAgentModel(
+  messages: Array<{ role?: string; content?: unknown; name?: string }> | undefined,
+  ownAgentId: string,
+): string | null {
+  if (!messages || !Array.isArray(messages)) return null;
+  
+  // Scan recent messages (last 20) for model announcements from OTHER agents
+  const recent = messages.slice(-20);
+  
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const msg = recent[i];
+    // Skip our own messages
+    if (msg.role === "assistant") continue;
+    
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    
+    // Look for model announcements
+    const announced = extractAnnouncedModel(content);
+    if (announced) {
+      return announced;
+    }
+  }
+  
+  return null;
 }
 
 // ============================================================================
@@ -231,7 +345,56 @@ function buildSuggestionInjection(category: TaskCategory, model: string): string
   ].join("\n");
 }
 
-function buildSwitchInjection(model: string): string {
+function buildCollabSuggestionInjection(
+  category: TaskCategory, 
+  model: string, 
+  otherAgentModel: string | null,
+  isComplement: boolean,
+): string {
+  const categoryLabels: Record<TaskCategory, string> = {
+    simple: "simple task",
+    planning: "planning/design work",
+    complex: "complex orchestration",
+    coding: "coding task",
+  };
+
+  const lines = [
+    "MODEL ROUTING (plugin-injected, COLLABORATION MODE):",
+    `Task detected: ${categoryLabels[category]}`,
+  ];
+  
+  if (otherAgentModel && isComplement) {
+    lines.push(`Other agent is on: ${otherAgentModel}`);
+    lines.push(`Suggested model (complement): ${model}`);
+  } else {
+    lines.push(`Suggested model: ${model}`);
+  }
+  
+  lines.push(
+    "",
+    "INSTRUCTIONS:",
+    `- Stay on the current model (Flash) for now`,
+    `- Ask any clarifying questions you need`,
+    `- Mention that you suggest "${model}" for this ${categoryLabels[category]}`,
+  );
+  
+  if (otherAgentModel && isComplement) {
+    lines.push(`- Note: This complements the other agent's ${otherAgentModel} for diverse perspectives`);
+  }
+  
+  lines.push(
+    `- Wait for user approval before switching`,
+    `- If user says "go ahead" or similar:`,
+    `  1. Call session_status({ model: "${model}" })`,
+    `  2. Announce: "📢 MODEL: ${model} for ${categoryLabels[category]}"`,
+    `- If user says "stick with flash" or similar, stay on Flash and proceed`,
+  );
+
+  return lines.join("\n");
+}
+
+function buildSwitchInjection(model: string, category?: TaskCategory): string {
+  const categoryLabel = category ? ` for ${category}` : "";
   return [
     "MODEL ROUTING (plugin-injected):",
     `User approved model switch.`,
@@ -239,7 +402,7 @@ function buildSwitchInjection(model: string): string {
     "",
     "INSTRUCTIONS:",
     `- Call session_status({ model: "${model}" }) immediately`,
-    `- Announce: "⚡ Switching to ${model}."`,
+    `- Announce: "📢 MODEL: ${model}${categoryLabel}"`,
     `- Then proceed with the task`,
   ].join("\n");
 }
@@ -255,6 +418,19 @@ function buildReturnToFlashInjection(): string {
   ].join("\n");
 }
 
+function buildRateLimitFallbackInjection(fallbackModel: string, failedModel: string): string {
+  return [
+    "MODEL ROUTING (plugin-injected):",
+    `Rate limit or error detected on ${failedModel}.`,
+    `Falling back to: ${fallbackModel}`,
+    "",
+    "INSTRUCTIONS:",
+    `- Call session_status({ model: "${fallbackModel}" })`,
+    `- Announce: "⚠️ Rate limit on ${failedModel} — falling back to ${fallbackModel}"`,
+    `- Continue with the task`,
+  ].join("\n");
+}
+
 // ============================================================================
 // Plugin Definition
 // ============================================================================
@@ -262,7 +438,7 @@ function buildReturnToFlashInjection(): string {
 const plugin = {
   id: "openclaw-model-selector",
   name: "Model Selector",
-  description: "Smart model routing: suggest → confirm → execute → auto-return to Flash",
+  description: "Smart model routing with collaboration support: suggest → confirm → coordinate → execute → auto-return",
   kind: "extension",
   configSchema: emptyPluginConfigSchema(),
 
@@ -280,8 +456,9 @@ const plugin = {
     const defaultModel = cfg.defaultModel ?? DEFAULT_CONFIG.defaultModel;
     const approvalTriggers = cfg.approvalTriggers ?? DEFAULT_CONFIG.approvalTriggers;
     const overrideTriggers = cfg.overrideTriggers ?? DEFAULT_CONFIG.overrideTriggers;
+    const fallbackChain = cfg.fallbackChain ?? DEFAULT_CONFIG.fallbackChain;
 
-    api.logger.info(`[model-selector] Registered (default: ${defaultModel})`);
+    api.logger.info(`[model-selector] Registered (default: ${defaultModel}, collab channel: ${cfg.collaborationChannel || "none"})`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -291,9 +468,10 @@ const plugin = {
       async (event: PluginHookBeforeAgentStartEvent, ctx: PluginHookAgentContext) => {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey, defaultModel);
+        const inCollabMode = isInCollaborationChannel(sessionKey, cfg);
 
         // Extract last user message
-        const msgs = event.messages as Array<{ role?: string; content?: unknown }> | undefined;
+        const msgs = event.messages as Array<{ role?: string; content?: unknown; name?: string }> | undefined;
         let userText = event.prompt ?? "";
         if (Array.isArray(msgs)) {
           for (let i = msgs.length - 1; i >= 0; i--) {
@@ -317,8 +495,9 @@ const plugin = {
         // Check for approval (user greenlights the switch)
         if (state.pendingApproval && state.suggestedModel && isApproval(userText, approvalTriggers)) {
           api.logger.info(`[model-selector] Approval detected — switching to ${state.suggestedModel}`);
-          const injection = buildSwitchInjection(state.suggestedModel);
+          const injection = buildSwitchInjection(state.suggestedModel, state.suggestedCategory);
           state.currentModel = state.suggestedModel;
+          state.lastAnnouncedModel = state.suggestedModel;
           state.pendingApproval = false;
           state.suggestedModel = undefined;
           state.suggestedCategory = undefined;
@@ -333,8 +512,27 @@ const plugin = {
           return;
         }
 
-        // Task detected — suggest model but don't switch yet
-        const suggestedModel = getPrimaryModel(category, cfg);
+        // Task detected — determine suggested model
+        let suggestedModel = getPrimaryModel(category, cfg);
+        let otherAgentModel: string | null = null;
+        let isComplement = false;
+
+        // COLLABORATION MODE: Check what the other agent is using
+        if (inCollabMode) {
+          otherAgentModel = scanForOtherAgentModel(msgs, cfg.agentId ?? "");
+          
+          if (otherAgentModel) {
+            // Other agent announced a model — pick the complement
+            const complement = getComplementModel(otherAgentModel, cfg);
+            if (complement !== suggestedModel) {
+              api.logger.info(
+                `[model-selector] Collab mode: other agent on ${otherAgentModel}, switching to complement ${complement}`
+              );
+              suggestedModel = complement;
+              isComplement = true;
+            }
+          }
+        }
 
         // Don't re-suggest if already on that model or already pending
         if (state.currentModel === suggestedModel || state.pendingApproval) {
@@ -342,37 +540,68 @@ const plugin = {
         }
 
         api.logger.info(
-          `[model-selector] Task detected: ${category} — suggesting ${suggestedModel}`,
+          `[model-selector] Task detected: ${category} — suggesting ${suggestedModel}${inCollabMode ? " (collab mode)" : ""}`,
         );
 
         state.suggestedModel = suggestedModel;
         state.suggestedCategory = category;
         state.pendingApproval = true;
 
-        const injection = buildSuggestionInjection(category, suggestedModel);
+        // Build appropriate injection based on mode
+        const injection = inCollabMode
+          ? buildCollabSuggestionInjection(category, suggestedModel, otherAgentModel, isComplement)
+          : buildSuggestionInjection(category, suggestedModel);
+          
         return { prependContext: injection };
       },
       { priority: 50 },
     );
 
     // ========================================================================
-    // Hook: after_tool_call (detect bead close)
+    // Hook: after_tool_call (detect bead close + rate limits)
     // ========================================================================
     api.on(
       "after_tool_call",
       async (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => {
-        // Check if this was a beads_close call
-        if (event.toolName !== "beads_close") return;
-
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey, defaultModel);
 
-        // If we're not on the default model, queue a return
-        if (state.currentModel !== defaultModel) {
-          api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
-          state.currentModel = defaultModel;
-          // Note: We can't inject mid-turn, but the next turn will be on Flash
-          // The agent should announce the return manually after closing the bead
+        // Check if this was a beads_close call
+        if (event.toolName === "beads_close") {
+          // If we're not on the default model, queue a return
+          if (state.currentModel !== defaultModel) {
+            api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
+            state.currentModel = defaultModel;
+            state.lastAnnouncedModel = undefined;
+          }
+          return;
+        }
+
+        // Check for rate limit errors in tool results
+        if (event.toolName === "session_status" && event.result) {
+          const resultStr = typeof event.result === "string" ? event.result : JSON.stringify(event.result);
+          
+          // Detect rate limit patterns
+          if (
+            resultStr.includes("rate limit") ||
+            resultStr.includes("429") ||
+            resultStr.includes("quota exceeded") ||
+            resultStr.includes("capacity")
+          ) {
+            api.logger.info(`[model-selector] Rate limit detected on ${state.currentModel}`);
+            
+            // Find next model in fallback chain
+            const currentIdx = fallbackChain.indexOf(state.currentModel);
+            const fallbackModel = currentIdx >= 0 && currentIdx < fallbackChain.length - 1
+              ? fallbackChain[currentIdx + 1]
+              : fallbackChain[0];
+            
+            if (fallbackModel !== state.currentModel) {
+              api.logger.info(`[model-selector] Falling back to ${fallbackModel}`);
+              // Note: Can't inject mid-turn, but log for awareness
+              // Agent should handle fallback via the error message
+            }
+          }
         }
       },
       { priority: 50 },

@@ -1,6 +1,8 @@
 {
   "id": "openclaw-model-selector",
   "kind": "extension",
+  "version": "3.0.0",
+  "description": "Smart model routing with collaboration support: suggest → confirm → coordinate → execute → auto-return",
   "uiHints": {
     "enabled": {
       "label": "Enabled",
@@ -18,6 +20,16 @@
       "label": "Default Model",
       "placeholder": "gemini-flash",
       "help": "The default model for all conversations (returns here after task completion)"
+    },
+    "collaborationChannel": {
+      "label": "Collaboration Channel",
+      "placeholder": "1468402814106468402",
+      "help": "Channel ID where agents coordinate model selection for diversity"
+    },
+    "agentId": {
+      "label": "Agent ID",
+      "placeholder": "steve",
+      "help": "This agent's identifier for collaboration coordination"
     }
   },
   "configSchema": {
@@ -28,6 +40,14 @@
       "announceSwitch": { "type": "boolean" },
       "announceSuggestion": { "type": "boolean" },
       "defaultModel": { "type": "string" },
+      "collaborationChannel": { 
+        "type": "string",
+        "description": "Channel ID for agent collaboration (model diversity coordination)"
+      },
+      "agentId": { 
+        "type": "string",
+        "description": "This agent's identifier (e.g., 'steve' or 'dexter')"
+      },
       "models": {
         "type": "object",
         "additionalProperties": true,
@@ -57,6 +77,16 @@
             ]
           }
         }
+      },
+      "modelComplements": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Map of models to their complements for collaboration diversity"
+      },
+      "fallbackChain": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Fallback models when rate limits are hit"
       },
       "approvalTriggers": {
         "type": "array",

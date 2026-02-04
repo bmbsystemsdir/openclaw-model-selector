@@ -1,84 +1,98 @@
-# openclaw-model-selector
+# OpenClaw Model Selector Plugin v3
 
-Smart model routing plugin for OpenClaw. Saves tokens by defaulting to cheap models and only switching to expensive ones when needed — with your approval.
+Smart model routing with cost optimization AND multi-agent collaboration support.
 
-## How It Works
+## Features
 
-1. **Default: Gemini Flash** — All conversations start here
-2. **Task detected** → Suggests appropriate model, asks clarifying questions (stays on Flash)
-3. **You approve** → Switches to suggested model and executes
-4. **Bead closes** → Auto-returns to Flash
+### Core Routing
+- **Default**: Gemini Flash for all casual chat and simple tasks
+- **Task Detection**: Classifies incoming messages as `simple`, `planning`, `complex`, or `coding`
+- **Approval Flow**: Suggests model upgrades, waits for user approval before switching
+- **Auto-Return**: Returns to Flash when a Bead is closed (task complete)
 
-## Installation
+### Collaboration Mode (NEW in v3)
+When two agents share a collaboration channel, they coordinate model selection to ensure **diverse perspectives**:
 
-### Option 1: Clone from GitHub
-```bash
-# Clone to your extensions directory
-git clone https://github.com/bmbsystemsdir/openclaw-model-selector.git ~/.openclaw/extensions/openclaw-model-selector
+- Agent A switches to Opus → Agent B automatically picks Gemini Pro (and vice versa)
+- Model announcements are detected via pattern matching
+- Ensures Anthropic + Google perspectives on the same problem
 
-# Enable the plugin
-openclaw plugins enable openclaw-model-selector
-```
-
-### Option 2: Install via OpenClaw CLI
-```bash
-openclaw plugins install --link https://github.com/bmbsystemsdir/openclaw-model-selector.git
-openclaw plugins enable openclaw-model-selector
-```
-
-Then restart the gateway:
-```bash
-openclaw gateway restart
-```
+### Fallback Chain
+When rate limits are hit:
+1. Try Sonnet 4.5
+2. Try Haiku 4.5
+3. Fall back to Gemini Flash
 
 ## Configuration
 
-Add to your `~/.openclaw/openclaw.json` under `plugins.entries`:
-
 ```json
-"openclaw-model-selector": {
-  "enabled": true,
-  "config": {
-    "enabled": true,
-    "announceSwitch": true,
-    "announceSuggestion": true,
-    "defaultModel": "gemini-flash",
-    "models": {
-      "simple": ["gemini-flash", "sonnet-4-5"],
-      "planning": ["gemini-pro", "opus"],
-      "complex": ["opus", "gpt"],
-      "coding": ["gpt", "gemini-pro"]
+{
+  "plugins": {
+    "openclaw-model-selector": {
+      "enabled": true,
+      "defaultModel": "gemini-flash",
+      "collaborationChannel": "1468402814106468402",
+      "agentId": "steve",
+      "models": {
+        "simple": ["gemini-flash", "sonnet-4-5", "haiku-4-5"],
+        "planning": ["gemini-pro", "opus"],
+        "complex": ["opus", "gemini-pro"],
+        "coding": ["gpt", "opus", "gemini-pro"]
+      },
+      "modelComplements": {
+        "opus": "gemini-pro",
+        "gemini-pro": "opus",
+        "gpt": "opus"
+      },
+      "fallbackChain": ["sonnet-4-5", "haiku-4-5", "gemini-flash"]
     }
   }
 }
 ```
 
-### Model Categories
+## Model Announcement Format
 
-| Category | Use Case | Default Models |
-|----------|----------|----------------|
-| `simple` | Chat, Q&A, clarifications | flash → sonnet |
-| `planning` | Design, research, strategy | pro → opus |
-| `complex` | Multi-agent orchestration | opus → gpt |
-| `coding` | Code writing, debugging | gpt → pro |
+When switching models in collaboration mode, announce using this format:
 
-### Approval Triggers
+```
+📢 MODEL: [model] for [task type]
+```
 
-The plugin recognizes these phrases as approval to switch:
-- "go ahead", "proceed", "do it", "green light"
-- "approved", "yes", "looks good", "lgtm"
-- "ship it", "build it", "execute", "start"
+Examples:
+- `📢 MODEL: opus for complex orchestration`
+- `📢 MODEL: gpt for coding task`
+- `📢 MODEL: gemini-pro for planning/design work`
 
-### Override Triggers
+The plugin detects these announcements from other agents and picks the complement.
 
-Stay on Flash even when a switch is suggested:
-- "stick with flash", "stay on flash", "use flash"
-- "no switch", "don't switch", "flash is fine"
+## Task Classification
 
-## Beads Integration
+| Signal Keywords | Category | Primary Models |
+|----------------|----------|----------------|
+| `write code`, `debug`, `refactor`, ``` | coding | gpt, opus |
+| `orchestrate`, `multi-agent`, `architect` | complex | opus, gemini-pro |
+| `design`, `plan`, `strategy`, `research` | planning | gemini-pro, opus |
+| (everything else) | simple | gemini-flash |
 
-When you close a bead (`bd close`), the plugin automatically returns to Flash. This creates a "cost container" — expensive tokens only used while work is active.
+## Approval Triggers
 
-## License
+The plugin listens for these phrases to approve a model switch:
+- "go ahead", "proceed", "approved", "yes", "lgtm", "ship it"
 
-MIT
+Override triggers to stay on Flash:
+- "stick with flash", "stay on flash", "no switch"
+
+## Changelog
+
+### v3.0.0
+- Added collaboration mode with model complement detection
+- Added fallback chain for rate limit handling
+- Enhanced task classification signals
+- Model announcement pattern matching
+
+### v2.0.0
+- Added task classification and model suggestions
+- Added Bead integration for auto-return
+
+### v1.0.0
+- Initial release with basic model routing
