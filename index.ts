@@ -62,6 +62,9 @@ interface SessionState {
   activeBeadId?: string;
   lastAnnouncedModel?: string;
   lastCheckedMessageId?: string;
+  // Error-triggered fallback (queued; applied on next turn)
+  pendingAutoSwitchModel?: string;
+  pendingAutoSwitchReason?: string;
 }
 
 // ============================================================================
@@ -496,6 +499,31 @@ const plugin = {
         const state = getState(sessionKey, defaultModel);
         const inCollabMode = isInCollaborationChannel(sessionKey, cfg);
 
+        // If we queued a fallback model due to rate-limit/quota/capacity, apply it now.
+        if (state.pendingAutoSwitchModel) {
+          const fallbackModel = state.pendingAutoSwitchModel;
+          const reason = state.pendingAutoSwitchReason ?? "rate limit/quota/capacity";
+
+          api.logger.warn(`[model-selector] Applying queued fallback switch to ${fallbackModel} (${reason})`);
+
+          // Clear queue before injecting to avoid loops
+          state.pendingAutoSwitchModel = undefined;
+          state.pendingAutoSwitchReason = undefined;
+
+          const injection = [
+            "MODEL ROUTING (plugin-injected):",
+            `Detected ${reason} — switching to fallback model: ${fallbackModel}`,
+            "",
+            "INSTRUCTIONS:",
+            `- Call session_status({ model: \"${fallbackModel}\" })`,
+            `- Announce: \"⚠️ ${reason} — falling back to ${fallbackModel}\"`,
+            "- Retry the last step/tool call that failed",
+          ].join("\n");
+
+          state.currentModel = fallbackModel;
+          return { prependContext: injection };
+        }
+
         // Extract last user message
         const msgs = event.messages as Array<{ role?: string; content?: unknown; name?: string }> | undefined;
         let userText = event.prompt ?? "";
@@ -605,22 +633,26 @@ const plugin = {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey, defaultModel);
 
-        // ERROR MONITORING: Fallback on rate limit / capacity errors
-        if (event.error && isRateLimitError(event.error)) {
+        // ERROR MONITORING: Fallback on rate limit / quota / capacity errors
+        const anyEvent = event as any;
+        const toolErr = anyEvent?.error ?? anyEvent?.err ?? anyEvent?.toolError;
+
+        if (isRateLimitError(toolErr)) {
+          const reason = "rate limit/quota/capacity";
           const category = state.suggestedCategory ?? "complex";
-          const models = cfg.models?.[category] ?? DEFAULT_CONFIG.models[category];
-          
-          if (Array.isArray(models) && models.length > 1) {
-            const nextIndex = models.indexOf(state.currentModel) + 1;
-            if (nextIndex > 0 && nextIndex < models.length) {
-              const fallbackModel = models[nextIndex];
-              api.logger.warn(`[model-selector] Rate limit detected. Falling back: ${state.currentModel} → ${fallbackModel}`);
-              state.currentModel = fallbackModel;
-              
-              return { 
-                prependContext: `MODEL ROUTING (plugin-injected):\nRate limit/capacity error detected for ${event.toolName}.\nAuto-switching to fallback model: ${fallbackModel}.\n\nPlease retry the previous tool call.` 
-              };
-            }
+          const models = (cfg.models?.[category] ?? DEFAULT_CONFIG.models[category]) as unknown;
+          const list = Array.isArray(models) ? (models as string[]) : [String(models)];
+
+          const idx = list.indexOf(state.currentModel);
+          const nextIdx = idx >= 0 ? idx + 1 : 1;
+          const fallbackModel = nextIdx < list.length ? list[nextIdx] : undefined;
+
+          if (fallbackModel && fallbackModel !== state.currentModel) {
+            api.logger.warn(`[model-selector] ${reason} detected. Queuing fallback: ${state.currentModel} → ${fallbackModel}`);
+            state.pendingAutoSwitchModel = fallbackModel;
+            state.pendingAutoSwitchReason = reason;
+          } else {
+            api.logger.warn(`[model-selector] ${reason} detected but no fallback available (model=${state.currentModel})`);
           }
         }
 

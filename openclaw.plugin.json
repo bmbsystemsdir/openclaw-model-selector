@@ -30,6 +30,10 @@
       "label": "Agent ID",
       "placeholder": "steve",
       "help": "This agent's identifier for collaboration coordination"
+    },
+    "collaborationAutoSwitch": {
+      "label": "Collab Auto-Switch",
+      "help": "If enabled, agents auto-switch models in the collaboration channel without approval (still announces switches)"
     }
   },
   "configSchema": {
@@ -47,6 +51,10 @@
       "agentId": { 
         "type": "string",
         "description": "This agent's identifier (e.g., 'steve' or 'dexter')"
+      },
+      "collaborationAutoSwitch": {
+        "type": "boolean",
+        "description": "If true, skip approval gating in collaborationChannel and auto-switch immediately (still announces)."
       },
       "models": {
         "type": "object",
