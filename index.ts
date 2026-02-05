@@ -279,52 +279,18 @@ function getState(sessionKey: string, defaultModel: string): SessionState {
 // ============================================================================
 
 function buildSuggestionInjection(category: TaskCategory, model: string): string {
-  const categoryLabels: Record<TaskCategory, string> = {
-    simple: "simple task",
-    planning: "planning/design work",
-    complex: "complex orchestration",
-    coding: "coding task",
-  };
-
-  return [
-    "MODEL ROUTING (plugin-injected):",
-    `Task detected: ${categoryLabels[category]}`,
-    `Suggested model: ${model}`,
-    "",
-    "INSTRUCTIONS:",
-    `- Stay on the current model (Flash) for now`,
-    `- Ask any clarifying questions you need`,
-    `- Mention that you suggest "${model}" for this ${categoryLabels[category]}`,
-    `- Wait for user approval before switching`,
-    `- If user says "go ahead" or similar, call session_status({ model: "${model}" }) and proceed`,
-    `- If user says "stick with flash" or similar, stay on Flash and proceed`,
-  ].join("\n");
+  // Return empty string - suggestion logic is now internal only, no Discord output
+  return "";
 }
 
 function buildSwitchInjection(model: string): string {
-  return [
-    "MODEL ROUTING (plugin-injected):",
-    `User approved model switch.`,
-    `Switch to: ${model}`,
-    "",
-    "INSTRUCTIONS:",
-    `- Call session_status({ model: "${model}" }) immediately`,
-    `- Announce: "📢 MODEL: ${model}"`,
-    `- Then proceed with the task`,
-  ].join("\n");
+  // Return empty string - switch logic is now internal only, no Discord output
+  return "";
 }
 
 function buildCollaborationSwitchInjection(model: string, otherModel: string): string {
-  return [
-    "MODEL ROUTING (plugin-injected):",
-    `Collaboration mode: Other agent detected on ${otherModel}.`,
-    `Auto-switching to complement: ${model}`,
-    "",
-    "INSTRUCTIONS:",
-    `- Call session_status({ model: "${model}" }) immediately`,
-    `- Announce: "📢 MODEL: ${model}"`,
-    `- Then proceed with the task`,
-  ].join("\n");
+  // Return empty string - collaboration logic is now internal only, no Discord output
+  return "";
 }
 
 // ============================================================================
