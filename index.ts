@@ -112,8 +112,9 @@ const CODING_SIGNALS = [
   "module",
 ];
 
-// Complex/orchestration signals
+// Complex/orchestration signals (including major academic projects)
 const COMPLEX_SIGNALS = [
+  // Technical orchestration
   "orchestrat",
   "coordinate",
   "multi-agent",
@@ -131,10 +132,17 @@ const COMPLEX_SIGNALS = [
   "design the",
   "multi-step workflow",
   "complex workflow",
+  // Major academic projects
+  "dissertation",
+  "comprehensive exam",
+  "systematic theology",
+  "research project",
+  "capstone",
 ];
 
-// Moderate signals (research, writing, analysis)
+// Moderate signals (research, writing, analysis, academic)
 const MODERATE_SIGNALS = [
+  // General research/analysis
   "research",
   "analyze",
   "evaluate",
@@ -146,6 +154,7 @@ const MODERATE_SIGNALS = [
   "what do you think",
   "help me understand",
   "explain in detail",
+  // Writing
   "draft",
   "write a",
   "document",
@@ -154,6 +163,24 @@ const MODERATE_SIGNALS = [
   "report",
   "memo",
   "outline",
+  // Academic/Seminary
+  "essay",
+  "paper",
+  "thesis",
+  "sermon",
+  "exegesis",
+  "hermeneutic",
+  "commentary",
+  "bibliography",
+  "citation",
+  "literature review",
+  "study guide",
+  "lecture notes",
+  "greek",
+  "hebrew",
+  "theological",
+  "doctrine",
+  "scripture",
 ];
 
 function classifyTask(text: string): TaskCategory {
