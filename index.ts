@@ -26,17 +26,17 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 // Types
 // ============================================================================
 
-type TaskCategory = "simple" | "planning" | "complex" | "coding";
+type TaskCategory = "simple" | "moderate" | "complex" | "coding";
 
 interface ModelSelectorConfig {
   enabled?: boolean;
   announceSwitch?: boolean;
   announceSuggestion?: boolean;
   models?: {
-    simple?: string[];
-    planning?: string[];
-    complex?: string[];
-    coding?: string[];
+    simple?: string[];      // Tier 1: stay on default (haiku)
+    moderate?: string[];    // Tier 2: sonnet, gemini-flash
+    complex?: string[];     // Tier 3: opus, gemini-pro, gpt-5.2
+    coding?: string[];      // Tier 3: opus, gemini-pro
   };
   approvalTriggers?: string[];
   overrideTriggers?: string[];
@@ -48,6 +48,7 @@ interface SessionState {
   suggestedCategory?: TaskCategory;
   pendingApproval: boolean;
   activeTodoistTaskId?: string;
+  needsReturnAnnouncement: boolean; // Set when task completes, triggers return injection
 }
 
 // ============================================================================
@@ -59,9 +60,13 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   announceSwitch: true,
   announceSuggestion: true,
   models: {
-    simple: ["gemini-flash", "sonnet"],
-    planning: ["gemini-pro", "opus"],
-    complex: ["opus", "sonnet"],
+    // Tier 1: Stay on default (haiku) - no upgrade needed
+    simple: [],
+    // Tier 2: Mid-weight - research, multi-step, analysis
+    moderate: ["sonnet", "gemini-flash"],
+    // Tier 3: Heavy - architecture, orchestration, planning
+    complex: ["opus", "gemini-pro", "openai-codex/gpt-5.2"],
+    // Tier 3: Coding - needs the best reasoning
     coding: ["opus", "gemini-pro"],
   },
   approvalTriggers: [
@@ -94,6 +99,7 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
 // Classification
 // ============================================================================
 
+// Tier 3: Coding - needs best reasoning for code generation/debugging
 const CODING_SIGNALS = [
   "```",
   "write code",
@@ -118,6 +124,7 @@ const CODING_SIGNALS = [
   "exception",
 ];
 
+// Tier 3: Complex - orchestration, architecture, major builds
 const COMPLEX_SIGNALS = [
   "orchestrat",
   "coordinate",
@@ -132,37 +139,44 @@ const COMPLEX_SIGNALS = [
   "rollout",
   "security review",
   "audit",
+  "build the",
+  "create the",
+  "design the system",
+  "infrastructure",
 ];
 
-const PLANNING_SIGNALS = [
-  "design",
-  "plan",
-  "strategy",
-  "roadmap",
+// Tier 2: Moderate - research, analysis, multi-step but not heavy
+const MODERATE_SIGNALS = [
   "research",
   "analyze",
   "evaluate",
   "compare",
   "recommend",
-  "proposal",
-  "rfc",
-  "spec",
-  "requirements",
+  "summarize",
+  "review",
+  "investigate",
+  "look into",
+  "find out",
+  "what do you think",
+  "help me understand",
+  "explain",
+  "multi-step",
+  "several steps",
 ];
 
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
 
-  // Check for coding signals first (most specific)
+  // Tier 3: Check for coding signals first (most specific)
   if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
 
-  // Check for complex orchestration
+  // Tier 3: Check for complex orchestration/architecture
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
 
-  // Check for planning/design work
-  if (PLANNING_SIGNALS.some((s) => t.includes(s))) return "planning";
+  // Tier 2: Check for moderate work (research, analysis, multi-step)
+  if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
 
-  // Default to simple
+  // Tier 1: Default to simple (stays on haiku)
   return "simple";
 }
 
@@ -176,10 +190,13 @@ function isOverride(text: string, triggers: string[]): boolean {
   return triggers.some((trigger) => t.includes(trigger));
 }
 
-function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): string {
+function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): string | null {
   const models = cfg.models ?? DEFAULT_CONFIG.models;
   const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
-  return Array.isArray(categoryModels) ? categoryModels[0] : (categoryModels as string);
+  if (Array.isArray(categoryModels) && categoryModels.length > 0) {
+    return categoryModels[0];
+  }
+  return null; // No upgrade needed (e.g., simple stays on default)
 }
 
 // ============================================================================
@@ -193,6 +210,7 @@ function getState(sessionKey: string): SessionState {
     sessionStates.set(sessionKey, {
       currentModel: null, // null = on default model
       pendingApproval: false,
+      needsReturnAnnouncement: false,
     });
   }
   return sessionStates.get(sessionKey)!;
@@ -205,7 +223,7 @@ function getState(sessionKey: string): SessionState {
 function buildSuggestionInjection(category: TaskCategory, model: string): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
-    planning: "planning/design work",
+    moderate: "research/analysis work",
     complex: "complex orchestration",
     coding: "coding task",
   };
@@ -285,6 +303,14 @@ const plugin = {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey);
 
+        // Check if we need to return to default (after task completion)
+        if (state.needsReturnAnnouncement) {
+          api.logger.info(`[model-selector] Task completed — returning to default model`);
+          const injection = buildReturnToDefaultInjection();
+          state.needsReturnAnnouncement = false;
+          return { prependContext: injection };
+        }
+
         // Extract last user message
         const msgs = event.messages as Array<{ role?: string; content?: unknown }> | undefined;
         let userText = event.prompt ?? "";
@@ -321,13 +347,18 @@ const plugin = {
         // Classify the incoming message
         const category = classifyTask(userText);
 
-        // If simple, no suggestion needed
+        // If simple, no suggestion needed (stays on default)
         if (category === "simple") {
           return;
         }
 
-        // Task detected — suggest model but don't switch yet
+        // Task detected — get suggested model for this category
         const suggestedModel = getPrimaryModel(category, cfg);
+
+        // If no model configured for this category, or empty list, stay on default
+        if (!suggestedModel) {
+          return;
+        }
 
         // Don't re-suggest if already on that model or already pending
         if (state.currentModel === suggestedModel || state.pendingApproval) {
@@ -360,12 +391,12 @@ const plugin = {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey);
 
-        // If we're not on the default model, queue a return
+        // If we're on an upgraded model, queue a return to default
         if (state.currentModel !== null) {
-          api.logger.info(`[model-selector] Task completed — will return to default model`);
+          api.logger.info(`[model-selector] Task completed — queuing return to default model`);
           state.currentModel = null;
-          // Note: We can't inject mid-turn, but the next turn will be on default
-          // The agent should announce the return manually after completing the task
+          state.needsReturnAnnouncement = true;
+          // Next turn will inject return-to-default instructions
         }
       },
       { priority: 50 },
