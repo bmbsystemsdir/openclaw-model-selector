@@ -1,18 +1,19 @@
 /**
- * OpenClaw Model Selector Plugin v4
+ * OpenClaw Model Selector Plugin v5
  *
- * Auto-switching model routing with fallbacks:
- * - Classifies tasks into categories
- * - Auto-switches to best model (no approval needed)
+ * Approval-first model routing with fallbacks:
+ * - Classify task + suggest best model (wait for approval)
+ * - User approves model suggestion
+ * - Switch to approved model, then plan + execute
  * - Falls back through model list if primary unavailable
  * - Returns to default when Todoist task completes
  *
  * Categories:
  * - simple: stays on default (haiku)
- * - moderate: research, writing, analysis → sonnet, gemini-flash
- * - coding: code tasks → opus, sonnet, gemini-flash
- * - complex: orchestration, architecture → opus, gemini-pro
- * - audit: security/code review → gpt-5.2, opus
+ * - moderate: research, writing, analysis, data review → sonnet, gemini-flash
+ * - coding: code generation, debugging → opus, sonnet, gemini-flash
+ * - complex: orchestration, architecture, major projects → opus, gemini-pro
+ * - security-audit: code review, security review, bug hunting → gpt-5.2, opus
  */
 
 import type {
@@ -28,7 +29,7 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 // Types
 // ============================================================================
 
-type TaskCategory = "simple" | "moderate" | "coding" | "complex" | "audit";
+type TaskCategory = "simple" | "moderate" | "coding" | "complex" | "security-audit";
 
 interface ModelSelectorConfig {
   enabled?: boolean;
@@ -38,13 +39,17 @@ interface ModelSelectorConfig {
     moderate?: string[];
     coding?: string[];
     complex?: string[];
-    audit?: string[];
+    "security-audit"?: string[];
   };
 }
 
 interface SessionState {
   currentModel: string | null; // null = on default model
   needsReturnAnnouncement: boolean;
+  suggestedModel?: string; // Pending approval
+  suggestedCategory?: TaskCategory;
+  suggestedFallbacks?: string[];
+  pendingApproval: boolean;
 }
 
 // ============================================================================
@@ -55,16 +60,16 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   enabled: true,
   announceSwitch: true,
   models: {
-    // Tier 1: Stay on default (haiku)
+    // Tier 1: Stay on default (haiku) - simple Q&A, quick tasks
     simple: [],
-    // Tier 2: Research, writing, analysis
+    // Tier 2: Research, writing, analysis, data review
     moderate: ["sonnet", "gemini-flash"],
-    // Tier 3: Coding tasks (Opus for deep reasoning, fallback to faster models)
+    // Tier 3: Code generation, debugging, implementation
     coding: ["opus", "sonnet", "gemini-flash"],
-    // Tier 3: Orchestration, architecture, system design
+    // Tier 3: Orchestration, architecture, system design, major projects
     complex: ["opus", "gemini-pro"],
-    // Tier 3: Security audits, code review (GPT 5.2 is "thorough")
-    audit: ["openai-codex/gpt-5.2", "opus"],
+    // Tier 3: Security reviews, code audits, thorough bug hunts (GPT 5.2 is "thorough")
+    "security-audit": ["openai-codex/gpt-5.2", "opus"],
   },
 };
 
@@ -72,16 +77,19 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
 // Classification Signals
 // ============================================================================
 
-// Audit signals (check first - most specific)
-const AUDIT_SIGNALS = [
-  "audit",
+// Security/Code audit signals (check first - most specific)
+// Note: "audit my tasks" or "review this data" go to MODERATE, not here
+const SECURITY_AUDIT_SIGNALS = [
   "security review",
   "code review",
-  "find bugs",
-  "vulnerability",
-  "penetration",
-  "compliance",
-  "thorough review",
+  "find bugs in",
+  "find vulnerabilities",
+  "security audit",
+  "code audit",
+  "penetration test",
+  "compliance review",
+  "security issue",
+  "vulnerability assessment",
 ];
 
 // Coding signals
@@ -140,7 +148,7 @@ const COMPLEX_SIGNALS = [
   "capstone",
 ];
 
-// Moderate signals (research, writing, analysis, academic)
+// Moderate signals (research, writing, analysis, data review, academic)
 const MODERATE_SIGNALS = [
   // General research/analysis
   "research",
@@ -154,6 +162,13 @@ const MODERATE_SIGNALS = [
   "what do you think",
   "help me understand",
   "explain in detail",
+  // Data/task review (audit of data, not security)
+  "audit my tasks",
+  "review my list",
+  "clean up",
+  "organize",
+  "tidy up",
+  "consolidate",
   // Writing
   "draft",
   "write a",
@@ -186,8 +201,8 @@ const MODERATE_SIGNALS = [
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
 
-  // Check audit first (most specific, high-stakes)
-  if (AUDIT_SIGNALS.some((s) => t.includes(s))) return "audit";
+  // Check security audit first (most specific, high-stakes)
+  if (SECURITY_AUDIT_SIGNALS.some((s) => t.includes(s))) return "security-audit";
 
   // Check complex orchestration
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
@@ -195,7 +210,7 @@ function classifyTask(text: string): TaskCategory {
   // Check coding
   if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
 
-  // Check moderate (research, writing)
+  // Check moderate (research, writing, data review)
   if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
 
   // Default to simple (stays on haiku)
@@ -228,6 +243,7 @@ function getState(sessionKey: string): SessionState {
     sessionStates.set(sessionKey, {
       currentModel: null,
       needsReturnAnnouncement: false,
+      pendingApproval: false,
     });
   }
   return sessionStates.get(sessionKey)!;
@@ -237,13 +253,41 @@ function getState(sessionKey: string): SessionState {
 // Injection Builders
 // ============================================================================
 
+function buildSuggestionInjection(category: TaskCategory, model: string, fallbacks: string[]): string {
+  const categoryLabels: Record<TaskCategory, string> = {
+    simple: "simple task",
+    moderate: "research/analysis",
+    coding: "coding task",
+    complex: "complex orchestration",
+    "security-audit": "security/code audit",
+  };
+
+  const fallbackNote = fallbacks.length > 0
+    ? `Fallbacks if needed: ${fallbacks.join(", ")}`
+    : "No fallbacks configured";
+
+  return [
+    "MODEL ROUTING (plugin-injected):",
+    `Task detected: ${categoryLabels[category]}`,
+    `Suggested model: ${model}`,
+    fallbackNote,
+    "",
+    "INSTRUCTIONS:",
+    `- Ask any clarifying questions you need`,
+    `- Mention: "I suggest ${model} for this ${categoryLabels[category]}"`,
+    `- Wait for approval: "go ahead" / "proceed" / "yes" to switch`,
+    `- Or override: "stay on current" / "use this model instead" to keep default`,
+    `- Once approved, call session_status({ model: "${model}" }) and proceed with planning + execution`,
+  ].join("\n");
+}
+
 function buildSwitchInjection(category: TaskCategory, model: string, fallbacks: string[]): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
     moderate: "research/analysis",
     coding: "coding task",
     complex: "complex orchestration",
-    audit: "audit/review",
+    "security-audit": "security/code audit",
   };
 
   const fallbackNote = fallbacks.length > 0
@@ -328,10 +372,47 @@ const plugin = {
           }
         }
 
+        // Handle pending approval
+        if (state.pendingApproval && state.suggestedModel) {
+          // Check for approval or override
+          const t = userText.toLowerCase();
+          const approves = ["go ahead", "proceed", "yes", "yep", "approve", "ok", "do it", "lgtm"];
+          const overrides = ["stay on", "stay with", "keep current", "no switch", "use default"];
+
+          if (approves.some((a) => t.includes(a))) {
+            api.logger.info(
+              `[model-selector] Approval detected for ${state.suggestedModel}`,
+            );
+            const injection = buildSwitchInjection(
+              state.suggestedCategory!,
+              state.suggestedModel,
+              state.suggestedFallbacks || [],
+            );
+            state.currentModel = state.suggestedModel;
+            state.pendingApproval = false;
+            state.suggestedModel = undefined;
+            state.suggestedCategory = undefined;
+            state.suggestedFallbacks = undefined;
+            return { prependContext: injection };
+          }
+
+          if (overrides.some((o) => t.includes(o))) {
+            api.logger.info(`[model-selector] Override detected — staying on current model`);
+            state.pendingApproval = false;
+            state.suggestedModel = undefined;
+            state.suggestedCategory = undefined;
+            state.suggestedFallbacks = undefined;
+            return; // Don't inject anything, just proceed on current model
+          }
+
+          // Still waiting for approval, don't process this message as a new task
+          return;
+        }
+
         // Classify the incoming message
         const category = classifyTask(userText);
 
-        // If simple, no switch needed
+        // If simple, no suggestion needed
         if (category === "simple") {
           return;
         }
@@ -344,16 +425,23 @@ const plugin = {
           return; // No models configured for this category
         }
 
-        // Don't re-switch if already on this model
+        // Don't re-suggest if already on this model
         if (state.currentModel === primaryModel) {
           return;
         }
 
-        api.logger.info(`[model-selector] Auto-switching to ${primaryModel} for ${category}`);
+        api.logger.info(`[model-selector] Suggesting ${primaryModel} for ${category}`);
 
-        state.currentModel = primaryModel;
-        const fallbacks = modelList.slice(1);
-        const injection = buildSwitchInjection(category, primaryModel, fallbacks);
+        state.suggestedModel = primaryModel;
+        state.suggestedCategory = category;
+        state.suggestedFallbacks = modelList.slice(1);
+        state.pendingApproval = true;
+
+        const injection = buildSuggestionInjection(
+          category,
+          primaryModel,
+          state.suggestedFallbacks,
+        );
         return { prependContext: injection };
       },
       { priority: 50 },
