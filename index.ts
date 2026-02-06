@@ -22,7 +22,7 @@ import type {
   PluginHookAfterToolCallEvent,
   PluginHookToolContext,
 } from "openclaw/plugin-sdk";
-import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
+import { z } from "zod";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join, dirname } from "path";
@@ -86,6 +86,22 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled" | "workspaceD
 };
 
 const MODEL_STATE_FILE = ".beads/model-state.json";
+
+// ============================================================================
+// Config Schema
+// ============================================================================
+
+const modelSelectorConfigSchema = z.object({
+  enabled: z.boolean().optional().default(true),
+  announceSwitch: z.boolean().optional().default(true),
+  models: z.object({
+    simple: z.array(z.string()).optional(),
+    moderate: z.array(z.string()).optional(),
+    coding: z.array(z.string()).optional(),
+    complex: z.array(z.string()).optional(),
+    "security-audit": z.array(z.string()).optional(),
+  }).optional(),
+}).optional().default({});
 
 // ============================================================================
 // Classification Signals
@@ -348,12 +364,23 @@ const plugin = {
   name: "Model Selector",
   description: "Auto-switching model routing with Beads integration",
   kind: "extension",
-  configSchema: emptyPluginConfigSchema(),
+  configSchema: modelSelectorConfigSchema,
 
   register(api: OpenClawPluginApi) {
+    // Parse config with schema (provides defaults)
+    const parsed = modelSelectorConfigSchema.safeParse(api.pluginConfig);
+    const rawCfg = parsed.success ? parsed.data : {};
+    
     const cfg: ModelSelectorConfig = {
-      ...DEFAULT_CONFIG,
-      ...(api.pluginConfig as ModelSelectorConfig),
+      enabled: rawCfg?.enabled ?? DEFAULT_CONFIG.enabled,
+      announceSwitch: rawCfg?.announceSwitch ?? DEFAULT_CONFIG.announceSwitch,
+      models: {
+        simple: rawCfg?.models?.simple ?? DEFAULT_CONFIG.models.simple,
+        moderate: rawCfg?.models?.moderate ?? DEFAULT_CONFIG.models.moderate,
+        coding: rawCfg?.models?.coding ?? DEFAULT_CONFIG.models.coding,
+        complex: rawCfg?.models?.complex ?? DEFAULT_CONFIG.models.complex,
+        "security-audit": rawCfg?.models?.["security-audit"] ?? DEFAULT_CONFIG.models["security-audit"],
+      },
     };
 
     // Get workspace dir from config or env
