@@ -1,16 +1,18 @@
 /**
- * OpenClaw Model Selector Plugin v3
+ * OpenClaw Model Selector Plugin v4
  *
- * Smart model routing with cost optimization:
- * - Task detection: Suggests appropriate model, waits for approval
- * - Todoist integration: Auto-returns to default model when task completes
- * - Per-category fallbacks: If primary model fails, cascades to fallback
+ * Auto-switching model routing with fallbacks:
+ * - Classifies tasks into categories
+ * - Auto-switches to best model (no approval needed)
+ * - Falls back through model list if primary unavailable
+ * - Returns to default when Todoist task completes
  *
- * Flow:
- * 1. Start on configured default model
- * 2. Detect task → Suggest model
- * 3. User approves → Switch to suggested model
- * 4. Task completes (Todoist) → Auto-return to default
+ * Categories:
+ * - simple: stays on default (haiku)
+ * - moderate: research, writing, analysis → sonnet, gemini-flash
+ * - coding: code tasks → opus, sonnet, gemini-flash
+ * - complex: orchestration, architecture → opus, gemini-pro
+ * - audit: security/code review → gpt-5.2, opus
  */
 
 import type {
@@ -26,80 +28,63 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 // Types
 // ============================================================================
 
-type TaskCategory = "simple" | "moderate" | "complex" | "coding";
+type TaskCategory = "simple" | "moderate" | "coding" | "complex" | "audit";
 
 interface ModelSelectorConfig {
   enabled?: boolean;
   announceSwitch?: boolean;
-  announceSuggestion?: boolean;
   models?: {
-    simple?: string[];      // Tier 1: stay on default (haiku)
-    moderate?: string[];    // Tier 2: sonnet, gemini-flash
-    complex?: string[];     // Tier 3: opus, gemini-pro, gpt-5.2
-    coding?: string[];      // Tier 3: opus, gemini-pro
+    simple?: string[];
+    moderate?: string[];
+    coding?: string[];
+    complex?: string[];
+    audit?: string[];
   };
-  approvalTriggers?: string[];
-  overrideTriggers?: string[];
 }
 
 interface SessionState {
   currentModel: string | null; // null = on default model
-  suggestedModel?: string;
-  suggestedCategory?: TaskCategory;
-  pendingApproval: boolean;
-  activeTodoistTaskId?: string;
-  needsReturnAnnouncement: boolean; // Set when task completes, triggers return injection
+  needsReturnAnnouncement: boolean;
 }
 
 // ============================================================================
-// Defaults
+// Defaults (easy to update as models evolve)
 // ============================================================================
 
 const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled: boolean } = {
   enabled: true,
   announceSwitch: true,
-  announceSuggestion: true,
   models: {
-    // Tier 1: Stay on default (haiku) - no upgrade needed
+    // Tier 1: Stay on default (haiku)
     simple: [],
-    // Tier 2: Mid-weight - research, multi-step, analysis
+    // Tier 2: Research, writing, analysis
     moderate: ["sonnet", "gemini-flash"],
-    // Tier 3: Heavy - architecture, orchestration, planning
-    complex: ["opus", "gemini-pro", "openai-codex/gpt-5.2"],
-    // Tier 3: Coding - needs the best reasoning
-    coding: ["opus", "gemini-pro"],
+    // Tier 3: Coding tasks (Opus for deep reasoning, fallback to faster models)
+    coding: ["opus", "sonnet", "gemini-flash"],
+    // Tier 3: Orchestration, architecture, system design
+    complex: ["opus", "gemini-pro"],
+    // Tier 3: Security audits, code review (GPT 5.2 is "thorough")
+    audit: ["openai-codex/gpt-5.2", "opus"],
   },
-  approvalTriggers: [
-    "go ahead",
-    "proceed",
-    "do it",
-    "green light",
-    "approved",
-    "yes",
-    "yeah",
-    "yep",
-    "looks good",
-    "lgtm",
-    "ship it",
-    "build it",
-    "execute",
-    "start",
-    "begin",
-  ],
-  overrideTriggers: [
-    "stick with",
-    "stay on",
-    "keep",
-    "no switch",
-    "don't switch",
-  ],
 };
 
 // ============================================================================
-// Classification
+// Classification Signals
 // ============================================================================
 
-// Tier 3: Coding - needs best reasoning for code generation/debugging
+// Audit signals (check first - most specific)
+const AUDIT_SIGNALS = [
+  "audit",
+  "security review",
+  "code review",
+  "find bugs",
+  "vulnerability",
+  "penetration",
+  "compliance",
+  "thorough review",
+];
+
+// Coding signals
 const CODING_SIGNALS = [
   "```",
   "write code",
@@ -122,9 +107,12 @@ const CODING_SIGNALS = [
   "stack trace",
   "error:",
   "exception",
+  "function",
+  "class",
+  "module",
 ];
 
-// Tier 3: Complex - orchestration, architecture, major builds
+// Complex/orchestration signals
 const COMPLEX_SIGNALS = [
   "orchestrat",
   "coordinate",
@@ -137,57 +125,54 @@ const COMPLEX_SIGNALS = [
   "end-to-end",
   "migrate",
   "rollout",
-  "security review",
-  "audit",
-  "build the",
-  "create the",
-  "design the system",
   "infrastructure",
+  "build the",
+  "create the system",
+  "design the",
+  "multi-step workflow",
+  "complex workflow",
 ];
 
-// Tier 2: Moderate - research, analysis, multi-step but not heavy
+// Moderate signals (research, writing, analysis)
 const MODERATE_SIGNALS = [
   "research",
   "analyze",
   "evaluate",
   "compare",
-  "recommend",
   "summarize",
-  "review",
   "investigate",
   "look into",
-  "find out",
+  "find out about",
   "what do you think",
   "help me understand",
-  "explain",
-  "multi-step",
-  "several steps",
+  "explain in detail",
+  "draft",
+  "write a",
+  "document",
+  "proposal",
+  "email",
+  "report",
+  "memo",
+  "outline",
 ];
 
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
 
-  // Tier 3: Check for coding signals first (most specific)
-  if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
+  // Check audit first (most specific, high-stakes)
+  if (AUDIT_SIGNALS.some((s) => t.includes(s))) return "audit";
 
-  // Tier 3: Check for complex orchestration/architecture
+  // Check complex orchestration
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
 
-  // Tier 2: Check for moderate work (research, analysis, multi-step)
+  // Check coding
+  if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
+
+  // Check moderate (research, writing)
   if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
 
-  // Tier 1: Default to simple (stays on haiku)
+  // Default to simple (stays on haiku)
   return "simple";
-}
-
-function isApproval(text: string, triggers: string[]): boolean {
-  const t = text.toLowerCase().trim();
-  return triggers.some((trigger) => t.includes(trigger));
-}
-
-function isOverride(text: string, triggers: string[]): boolean {
-  const t = text.toLowerCase().trim();
-  return triggers.some((trigger) => t.includes(trigger));
 }
 
 function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): string | null {
@@ -196,7 +181,13 @@ function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): stri
   if (Array.isArray(categoryModels) && categoryModels.length > 0) {
     return categoryModels[0];
   }
-  return null; // No upgrade needed (e.g., simple stays on default)
+  return null;
+}
+
+function getModelList(category: TaskCategory, cfg: ModelSelectorConfig): string[] {
+  const models = cfg.models ?? DEFAULT_CONFIG.models;
+  const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
+  return Array.isArray(categoryModels) ? categoryModels : [];
 }
 
 // ============================================================================
@@ -208,8 +199,7 @@ const sessionStates = new Map<string, SessionState>();
 function getState(sessionKey: string): SessionState {
   if (!sessionStates.has(sessionKey)) {
     sessionStates.set(sessionKey, {
-      currentModel: null, // null = on default model
-      pendingApproval: false,
+      currentModel: null,
       needsReturnAnnouncement: false,
     });
   }
@@ -220,50 +210,40 @@ function getState(sessionKey: string): SessionState {
 // Injection Builders
 // ============================================================================
 
-function buildSuggestionInjection(category: TaskCategory, model: string): string {
+function buildSwitchInjection(category: TaskCategory, model: string, fallbacks: string[]): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
-    moderate: "research/analysis work",
-    complex: "complex orchestration",
+    moderate: "research/analysis",
     coding: "coding task",
+    complex: "complex orchestration",
+    audit: "audit/review",
   };
 
-  return [
-    "MODEL ROUTING (plugin-injected):",
-    `Task detected: ${categoryLabels[category]}`,
-    `Suggested model: ${model}`,
-    "",
-    "INSTRUCTIONS:",
-    `- Stay on the current model for now`,
-    `- Ask any clarifying questions you need`,
-    `- Mention that you suggest "${model}" for this ${categoryLabels[category]}`,
-    `- Wait for user approval before switching`,
-    `- If user says "go ahead" or similar, call session_status({ model: "${model}" }) and proceed`,
-    `- If user overrides, stay on current model and proceed`,
-  ].join("\n");
-}
+  const fallbackNote = fallbacks.length > 0
+    ? `Fallbacks if needed: ${fallbacks.join(", ")}`
+    : "No fallbacks configured";
 
-function buildSwitchInjection(model: string): string {
   return [
-    "MODEL ROUTING (plugin-injected):",
-    `User approved model switch.`,
-    `Switch to: ${model}`,
+    "MODEL ROUTING (auto-switch):",
+    `Task: ${categoryLabels[category]}`,
+    `Switching to: ${model}`,
+    fallbackNote,
     "",
     "INSTRUCTIONS:",
     `- Call session_status({ model: "${model}" }) immediately`,
-    `- Announce: "⚡ Switching to ${model}."`,
+    `- Briefly note: "⚡ ${model} for ${categoryLabels[category]}"`,
     `- Then proceed with the task`,
   ].join("\n");
 }
 
 function buildReturnToDefaultInjection(): string {
   return [
-    "MODEL ROUTING (plugin-injected):",
-    "Task complete.",
+    "MODEL ROUTING (auto-return):",
+    "Task complete — returning to default model.",
     "",
     "INSTRUCTIONS:",
-    `- Call session_status({ model: "default" }) to return to default model`,
-    `- Announce: "⚡ Task complete — returning to default model."`,
+    `- Call session_status({ model: "default" })`,
+    `- Note: "⚡ Back to default model"`,
   ].join("\n");
 }
 
@@ -274,7 +254,7 @@ function buildReturnToDefaultInjection(): string {
 const plugin = {
   id: "openclaw-model-selector",
   name: "Model Selector",
-  description: "Smart model routing: suggest → confirm → execute → auto-return to default",
+  description: "Auto-switching model routing with fallbacks per task category",
   kind: "extension",
   configSchema: emptyPluginConfigSchema(),
 
@@ -289,10 +269,7 @@ const plugin = {
       return;
     }
 
-    const approvalTriggers = cfg.approvalTriggers ?? DEFAULT_CONFIG.approvalTriggers;
-    const overrideTriggers = cfg.overrideTriggers ?? DEFAULT_CONFIG.overrideTriggers;
-
-    api.logger.info(`[model-selector] Registered`);
+    api.logger.info(`[model-selector] Registered (auto-switch mode)`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -305,7 +282,7 @@ const plugin = {
 
         // Check if we need to return to default (after task completion)
         if (state.needsReturnAnnouncement) {
-          api.logger.info(`[model-selector] Task completed — returning to default model`);
+          api.logger.info(`[model-selector] Returning to default model`);
           const injection = buildReturnToDefaultInjection();
           state.needsReturnAnnouncement = false;
           return { prependContext: injection };
@@ -324,56 +301,32 @@ const plugin = {
           }
         }
 
-        // Check for override (user wants to stay on current model)
-        if (state.pendingApproval && isOverride(userText, overrideTriggers)) {
-          api.logger.info(`[model-selector] User override — staying on current model`);
-          state.pendingApproval = false;
-          state.suggestedModel = undefined;
-          state.suggestedCategory = undefined;
-          return; // No injection needed
-        }
-
-        // Check for approval (user greenlights the switch)
-        if (state.pendingApproval && state.suggestedModel && isApproval(userText, approvalTriggers)) {
-          api.logger.info(`[model-selector] Approval detected — switching to ${state.suggestedModel}`);
-          const injection = buildSwitchInjection(state.suggestedModel);
-          state.currentModel = state.suggestedModel;
-          state.pendingApproval = false;
-          state.suggestedModel = undefined;
-          state.suggestedCategory = undefined;
-          return { prependContext: injection };
-        }
-
         // Classify the incoming message
         const category = classifyTask(userText);
 
-        // If simple, no suggestion needed (stays on default)
+        // If simple, no switch needed
         if (category === "simple") {
           return;
         }
 
-        // Task detected — get suggested model for this category
-        const suggestedModel = getPrimaryModel(category, cfg);
+        // Get model for this category
+        const modelList = getModelList(category, cfg);
+        const primaryModel = modelList[0];
 
-        // If no model configured for this category, or empty list, stay on default
-        if (!suggestedModel) {
+        if (!primaryModel) {
+          return; // No models configured for this category
+        }
+
+        // Don't re-switch if already on this model
+        if (state.currentModel === primaryModel) {
           return;
         }
 
-        // Don't re-suggest if already on that model or already pending
-        if (state.currentModel === suggestedModel || state.pendingApproval) {
-          return;
-        }
+        api.logger.info(`[model-selector] Auto-switching to ${primaryModel} for ${category}`);
 
-        api.logger.info(
-          `[model-selector] Task detected: ${category} — suggesting ${suggestedModel}`,
-        );
-
-        state.suggestedModel = suggestedModel;
-        state.suggestedCategory = category;
-        state.pendingApproval = true;
-
-        const injection = buildSuggestionInjection(category, suggestedModel);
+        state.currentModel = primaryModel;
+        const fallbacks = modelList.slice(1);
+        const injection = buildSwitchInjection(category, primaryModel, fallbacks);
         return { prependContext: injection };
       },
       { priority: 50 },
@@ -393,10 +346,9 @@ const plugin = {
 
         // If we're on an upgraded model, queue a return to default
         if (state.currentModel !== null) {
-          api.logger.info(`[model-selector] Task completed — queuing return to default model`);
+          api.logger.info(`[model-selector] Task completed — queuing return to default`);
           state.currentModel = null;
           state.needsReturnAnnouncement = true;
-          // Next turn will inject return-to-default instructions
         }
       },
       { priority: 50 },
