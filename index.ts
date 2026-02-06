@@ -1,17 +1,16 @@
 /**
- * OpenClaw Model Selector Plugin v2
+ * OpenClaw Model Selector Plugin v3
  *
  * Smart model routing with cost optimization:
- * - Default: Gemini Flash for all conversations
  * - Task detection: Suggests appropriate model, waits for approval
- * - Bead integration: Auto-returns to Flash when bead closes
+ * - Todoist integration: Auto-returns to default model when task completes
  * - Per-category fallbacks: If primary model fails, cascades to fallback
  *
  * Flow:
- * 1. Flash (default) - Clarification phase
- * 2. Detect task → Suggest model (stay on Flash)
+ * 1. Start on configured default model
+ * 2. Detect task → Suggest model
  * 3. User approves → Switch to suggested model
- * 4. Bead closes → Auto-return to Flash
+ * 4. Task completes (Todoist) → Auto-return to default
  */
 
 import type {
@@ -33,7 +32,6 @@ interface ModelSelectorConfig {
   enabled?: boolean;
   announceSwitch?: boolean;
   announceSuggestion?: boolean;
-  defaultModel?: string;
   models?: {
     simple?: string[];
     planning?: string[];
@@ -45,11 +43,11 @@ interface ModelSelectorConfig {
 }
 
 interface SessionState {
-  currentModel: string;
+  currentModel: string | null; // null = on default model
   suggestedModel?: string;
   suggestedCategory?: TaskCategory;
   pendingApproval: boolean;
-  activeBeadId?: string;
+  activeTodoistTaskId?: string;
 }
 
 // ============================================================================
@@ -60,12 +58,11 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
   enabled: true,
   announceSwitch: true,
   announceSuggestion: true,
-  defaultModel: "gemini-flash",
   models: {
-    simple: ["gemini-flash", "sonnet-4-5"],
+    simple: ["gemini-flash", "sonnet"],
     planning: ["gemini-pro", "opus"],
-    complex: ["opus", "gpt"],
-    coding: ["gpt", "gemini-pro"],
+    complex: ["opus", "sonnet"],
+    coding: ["opus", "gemini-pro"],
   },
   approvalTriggers: [
     "go ahead",
@@ -85,12 +82,9 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled
     "begin",
   ],
   overrideTriggers: [
-    "stick with flash",
-    "stay on flash",
-    "keep flash",
-    "use flash",
-    "just use flash",
-    "flash is fine",
+    "stick with",
+    "stay on",
+    "keep",
     "no switch",
     "don't switch",
   ],
@@ -194,10 +188,10 @@ function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): stri
 
 const sessionStates = new Map<string, SessionState>();
 
-function getState(sessionKey: string, defaultModel: string): SessionState {
+function getState(sessionKey: string): SessionState {
   if (!sessionStates.has(sessionKey)) {
     sessionStates.set(sessionKey, {
-      currentModel: defaultModel,
+      currentModel: null, // null = on default model
       pendingApproval: false,
     });
   }
@@ -222,12 +216,12 @@ function buildSuggestionInjection(category: TaskCategory, model: string): string
     `Suggested model: ${model}`,
     "",
     "INSTRUCTIONS:",
-    `- Stay on the current model (Flash) for now`,
+    `- Stay on the current model for now`,
     `- Ask any clarifying questions you need`,
     `- Mention that you suggest "${model}" for this ${categoryLabels[category]}`,
     `- Wait for user approval before switching`,
     `- If user says "go ahead" or similar, call session_status({ model: "${model}" }) and proceed`,
-    `- If user says "stick with flash" or similar, stay on Flash and proceed`,
+    `- If user overrides, stay on current model and proceed`,
   ].join("\n");
 }
 
@@ -244,14 +238,14 @@ function buildSwitchInjection(model: string): string {
   ].join("\n");
 }
 
-function buildReturnToFlashInjection(): string {
+function buildReturnToDefaultInjection(): string {
   return [
     "MODEL ROUTING (plugin-injected):",
-    "Bead closed — task complete.",
+    "Task complete.",
     "",
     "INSTRUCTIONS:",
-    `- Call session_status({ model: "gemini-flash" })`,
-    `- Announce: "⚡ Task complete — back on Gemini Flash."`,
+    `- Call session_status({ model: "default" }) to return to default model`,
+    `- Announce: "⚡ Task complete — returning to default model."`,
   ].join("\n");
 }
 
@@ -262,7 +256,7 @@ function buildReturnToFlashInjection(): string {
 const plugin = {
   id: "openclaw-model-selector",
   name: "Model Selector",
-  description: "Smart model routing: suggest → confirm → execute → auto-return to Flash",
+  description: "Smart model routing: suggest → confirm → execute → auto-return to default",
   kind: "extension",
   configSchema: emptyPluginConfigSchema(),
 
@@ -277,11 +271,10 @@ const plugin = {
       return;
     }
 
-    const defaultModel = cfg.defaultModel ?? DEFAULT_CONFIG.defaultModel;
     const approvalTriggers = cfg.approvalTriggers ?? DEFAULT_CONFIG.approvalTriggers;
     const overrideTriggers = cfg.overrideTriggers ?? DEFAULT_CONFIG.overrideTriggers;
 
-    api.logger.info(`[model-selector] Registered (default: ${defaultModel})`);
+    api.logger.info(`[model-selector] Registered`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -290,7 +283,7 @@ const plugin = {
       "before_agent_start",
       async (event: PluginHookBeforeAgentStartEvent, ctx: PluginHookAgentContext) => {
         const sessionKey = ctx.sessionKey ?? "unknown";
-        const state = getState(sessionKey, defaultModel);
+        const state = getState(sessionKey);
 
         // Extract last user message
         const msgs = event.messages as Array<{ role?: string; content?: unknown }> | undefined;
@@ -305,9 +298,9 @@ const plugin = {
           }
         }
 
-        // Check for override (user wants to stay on Flash)
+        // Check for override (user wants to stay on current model)
         if (state.pendingApproval && isOverride(userText, overrideTriggers)) {
-          api.logger.info(`[model-selector] User override — staying on Flash`);
+          api.logger.info(`[model-selector] User override — staying on current model`);
           state.pendingApproval = false;
           state.suggestedModel = undefined;
           state.suggestedCategory = undefined;
@@ -356,23 +349,23 @@ const plugin = {
     );
 
     // ========================================================================
-    // Hook: after_tool_call (detect bead close)
+    // Hook: after_tool_call (detect Todoist task completion)
     // ========================================================================
     api.on(
       "after_tool_call",
       async (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => {
-        // Check if this was a beads_close call
-        if (event.toolName !== "beads_close") return;
+        // Check if this was a complete-tasks call (Todoist via mcporter)
+        if (event.toolName !== "complete-tasks") return;
 
         const sessionKey = ctx.sessionKey ?? "unknown";
-        const state = getState(sessionKey, defaultModel);
+        const state = getState(sessionKey);
 
         // If we're not on the default model, queue a return
-        if (state.currentModel !== defaultModel) {
-          api.logger.info(`[model-selector] Bead closed — will return to ${defaultModel}`);
-          state.currentModel = defaultModel;
-          // Note: We can't inject mid-turn, but the next turn will be on Flash
-          // The agent should announce the return manually after closing the bead
+        if (state.currentModel !== null) {
+          api.logger.info(`[model-selector] Task completed — will return to default model`);
+          state.currentModel = null;
+          // Note: We can't inject mid-turn, but the next turn will be on default
+          // The agent should announce the return manually after completing the task
         }
       },
       { priority: 50 },
