@@ -22,7 +22,7 @@ import type {
   PluginHookAfterToolCallEvent,
   PluginHookToolContext,
 } from "openclaw/plugin-sdk";
-import { z } from "zod";
+import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join, dirname } from "path";
@@ -86,22 +86,6 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled" | "workspaceD
 };
 
 const MODEL_STATE_FILE = ".beads/model-state.json";
-
-// ============================================================================
-// Config Schema
-// ============================================================================
-
-const modelSelectorConfigSchema = z.object({
-  enabled: z.boolean().optional().default(true),
-  announceSwitch: z.boolean().optional().default(true),
-  models: z.object({
-    simple: z.array(z.string()).optional(),
-    moderate: z.array(z.string()).optional(),
-    coding: z.array(z.string()).optional(),
-    complex: z.array(z.string()).optional(),
-    "security-audit": z.array(z.string()).optional(),
-  }).optional(),
-}).optional().default({});
 
 // ============================================================================
 // Classification Signals
@@ -364,12 +348,25 @@ const plugin = {
   name: "Model Selector",
   description: "Auto-switching model routing with Beads integration",
   kind: "extension",
-  configSchema: modelSelectorConfigSchema,
+  configSchema: emptyPluginConfigSchema(),
 
   register(api: OpenClawPluginApi) {
-    // Parse config with schema (provides defaults)
-    const parsed = modelSelectorConfigSchema.safeParse(api.pluginConfig);
-    const rawCfg = parsed.success ? parsed.data : {};
+    // Get workspace dir from env
+    const workspaceDir = process.env.OPENCLAW_WORKSPACE || 
+      process.env.HOME + "/.openclaw/workspace";
+    
+    // Load config from workspace file (not openclaw.json)
+    const configPath = join(workspaceDir, "config/model-selector.json");
+    let rawCfg: ModelSelectorConfig = {};
+    
+    try {
+      if (existsSync(configPath)) {
+        rawCfg = JSON.parse(readFileSync(configPath, "utf-8"));
+        api.logger.info(`[model-selector] Loaded config from ${configPath}`);
+      }
+    } catch (e) {
+      api.logger.warn(`[model-selector] Failed to load config: ${e}`);
+    }
     
     const cfg: ModelSelectorConfig = {
       enabled: rawCfg?.enabled ?? DEFAULT_CONFIG.enabled,
@@ -382,11 +379,6 @@ const plugin = {
         "security-audit": rawCfg?.models?.["security-audit"] ?? DEFAULT_CONFIG.models["security-audit"],
       },
     };
-
-    // Get workspace dir from config or env
-    const workspaceDir = cfg.workspaceDir || 
-      process.env.OPENCLAW_WORKSPACE || 
-      process.env.HOME + "/.openclaw/workspace";
 
     if (cfg.enabled === false) {
       api.logger.info("[model-selector] Disabled via config");
