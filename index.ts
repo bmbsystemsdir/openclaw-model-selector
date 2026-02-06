@@ -272,12 +272,16 @@ function buildSuggestionInjection(category: TaskCategory, model: string, fallbac
     `Suggested model: ${model}`,
     fallbackNote,
     "",
-    "INSTRUCTIONS:",
-    `- Ask any clarifying questions you need`,
-    `- Mention: "I suggest ${model} for this ${categoryLabels[category]}"`,
-    `- Wait for approval: "go ahead" / "proceed" / "yes" to switch`,
-    `- Or override: "stay on current" / "use this model instead" to keep default`,
-    `- Once approved, call session_status({ model: "${model}" }) and proceed with planning + execution`,
+    "INSTRUCTIONS (all in one response):",
+    `1. Restate your understanding: "I understand you want to..."`,
+    `2. Ask clarifying questions if needed: "Quick question: ...?"`,
+    `3. Suggest the model: "This is ${categoryLabels[category]}, so I suggest ${model}"`,
+    `4. Wait for user approval in one shot (they can validate task + model together)`,
+    ``,
+    "Approval keywords: 'go ahead', 'proceed', 'yes', 'approve'",
+    "Override keywords: 'stay on', 'keep', 'no switch'",
+    "",
+    `5. Once approved: call session_status({ model: "${model}" }) then plan + execute`,
   ].join("\n");
 }
 
