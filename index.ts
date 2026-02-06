@@ -1,12 +1,11 @@
 /**
- * OpenClaw Model Selector Plugin v5
+ * OpenClaw Model Selector Plugin v6
  *
- * Approval-first model routing with fallbacks:
+ * Approval-first model routing with Beads integration:
  * - Classify task + suggest best model (wait for approval)
- * - User approves model suggestion
- * - Switch to approved model, then plan + execute
- * - Falls back through model list if primary unavailable
- * - Returns to default when Todoist task completes
+ * - User approves → create bead + switch to approved model
+ * - Plan + execute on upgraded model
+ * - On bead close: if still on that model, switch back to default
  *
  * Categories:
  * - simple: stays on default (haiku)
@@ -24,6 +23,9 @@ import type {
   PluginHookToolContext,
 } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
+import { join, dirname } from "path";
 
 // ============================================================================
 // Types
@@ -34,6 +36,7 @@ type TaskCategory = "simple" | "moderate" | "coding" | "complex" | "security-aud
 interface ModelSelectorConfig {
   enabled?: boolean;
   announceSwitch?: boolean;
+  workspaceDir?: string;
   models?: {
     simple?: string[];
     moderate?: string[];
@@ -45,191 +48,102 @@ interface ModelSelectorConfig {
 
 interface SessionState {
   currentModel: string | null; // null = on default model
+  currentBeadId: string | null; // bead tracking this work
   needsReturnAnnouncement: boolean;
   suggestedModel?: string; // Pending approval
   suggestedCategory?: TaskCategory;
   suggestedFallbacks?: string[];
+  suggestedTaskSummary?: string;
   pendingApproval: boolean;
 }
 
+interface ModelStateEntry {
+  beadId: string;
+  model: string;
+  category: TaskCategory;
+  createdAt: string;
+  sessionKey: string;
+}
+
+interface ModelStateFile {
+  activeEscalations: ModelStateEntry[];
+}
+
 // ============================================================================
-// Defaults (easy to update as models evolve)
+// Defaults
 // ============================================================================
 
-const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled: boolean } = {
+const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled" | "workspaceDir">> & { enabled: boolean } = {
   enabled: true,
   announceSwitch: true,
   models: {
-    // Tier 1: Stay on default (haiku) - simple Q&A, quick tasks
     simple: [],
-    // Tier 2: Research, writing, analysis, data review
     moderate: ["sonnet", "gemini-flash"],
-    // Tier 3: Code generation, debugging, implementation
     coding: ["opus", "sonnet", "gemini-flash"],
-    // Tier 3: Orchestration, architecture, system design, major projects
     complex: ["opus", "gemini-pro"],
-    // Tier 3: Security reviews, code audits, thorough bug hunts (GPT 5.2 is "thorough")
     "security-audit": ["openai-codex/gpt-5.2", "opus"],
   },
 };
+
+const MODEL_STATE_FILE = ".beads/model-state.json";
 
 // ============================================================================
 // Classification Signals
 // ============================================================================
 
-// Security/Code audit signals (check first - most specific)
-// Note: "audit my tasks" or "review this data" go to MODERATE, not here
 const SECURITY_AUDIT_SIGNALS = [
-  "security review",
-  "code review",
-  "find bugs in",
-  "find vulnerabilities",
-  "security audit",
-  "code audit",
-  "penetration test",
-  "compliance review",
-  "security issue",
-  "vulnerability assessment",
+  "security review", "code review", "find bugs in", "find vulnerabilities",
+  "security audit", "code audit", "penetration test", "compliance review",
+  "security issue", "vulnerability assessment",
 ];
 
-// Coding signals
 const CODING_SIGNALS = [
-  "```",
-  "write code",
-  "write a script",
-  "build a script",
-  "create a script",
-  "write a function",
-  "debug",
-  "fix this code",
-  "refactor",
-  "implement",
-  "typescript",
-  "javascript",
-  "python",
-  "bash",
-  "sql",
-  "api endpoint",
-  "unit test",
-  "pull request",
-  "stack trace",
-  "error:",
-  "exception",
-  "function",
-  "class",
-  "module",
+  "```", "write code", "write a script", "build a script", "create a script",
+  "write a function", "debug", "fix this code", "refactor", "implement",
+  "typescript", "javascript", "python", "bash", "sql", "api endpoint",
+  "unit test", "pull request", "stack trace", "error:", "exception",
+  "function", "class", "module",
 ];
 
-// Complex/orchestration signals (including major academic projects)
 const COMPLEX_SIGNALS = [
-  // Technical orchestration
-  "orchestrat",
-  "coordinate",
-  "multi-agent",
-  "sub-agent",
-  "spawn",
-  "delegate",
-  "architect",
-  "system design",
-  "end-to-end",
-  "migrate",
-  "rollout",
-  "infrastructure",
-  "build the",
-  "create the system",
-  "design the",
-  "multi-step workflow",
-  "complex workflow",
-  // Major academic projects
-  "dissertation",
-  "comprehensive exam",
-  "systematic theology",
-  "research project",
-  "capstone",
+  "orchestrat", "coordinate", "multi-agent", "sub-agent", "spawn", "delegate",
+  "architect", "system design", "end-to-end", "migrate", "rollout",
+  "infrastructure", "build the", "create the system", "design the",
+  "multi-step workflow", "complex workflow", "dissertation",
+  "comprehensive exam", "systematic theology", "research project", "capstone",
 ];
 
-// Moderate signals (research, writing, analysis, data review, academic)
 const MODERATE_SIGNALS = [
-  // General research/analysis
-  "research",
-  "analyze",
-  "evaluate",
-  "compare",
-  "summarize",
-  "investigate",
-  "look into",
-  "find out about",
-  "what do you think",
-  "help me understand",
-  "explain in detail",
-  // Data/task review (audit of data, not security)
-  "audit my tasks",
-  "review my list",
-  "clean up",
-  "organize",
-  "tidy up",
-  "consolidate",
-  // Writing
-  "draft",
-  "write a",
-  "document",
-  "proposal",
-  "email",
-  "report",
-  "memo",
-  "outline",
-  // Academic/Seminary
-  "essay",
-  "paper",
-  "thesis",
-  "sermon",
-  "exegesis",
-  "hermeneutic",
-  "commentary",
-  "bibliography",
-  "citation",
-  "literature review",
-  "study guide",
-  "lecture notes",
-  "greek",
-  "hebrew",
-  "theological",
-  "doctrine",
-  "scripture",
+  "research", "analyze", "evaluate", "compare", "summarize", "investigate",
+  "look into", "find out about", "what do you think", "help me understand",
+  "explain in detail", "audit my tasks", "review my list", "clean up",
+  "organize", "tidy up", "consolidate", "draft", "write a", "document",
+  "proposal", "email", "report", "memo", "outline", "essay", "paper",
+  "thesis", "sermon", "exegesis", "hermeneutic", "commentary", "bibliography",
+  "citation", "literature review", "study guide", "lecture notes", "greek",
+  "hebrew", "theological", "doctrine", "scripture",
 ];
 
 function classifyTask(text: string): TaskCategory {
   const t = text.toLowerCase();
-
-  // Check security audit first (most specific, high-stakes)
   if (SECURITY_AUDIT_SIGNALS.some((s) => t.includes(s))) return "security-audit";
-
-  // Check complex orchestration
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
-
-  // Check coding
   if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
-
-  // Check moderate (research, writing, data review)
   if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
-
-  // Default to simple (stays on haiku)
   return "simple";
-}
-
-function getPrimaryModel(category: TaskCategory, cfg: ModelSelectorConfig): string | null {
-  const models = cfg.models ?? DEFAULT_CONFIG.models;
-  const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
-  if (Array.isArray(categoryModels) && categoryModels.length > 0) {
-    return categoryModels[0];
-  }
-  return null;
 }
 
 function getModelList(category: TaskCategory, cfg: ModelSelectorConfig): string[] {
   const models = cfg.models ?? DEFAULT_CONFIG.models;
   const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
   return Array.isArray(categoryModels) ? categoryModels : [];
+}
+
+function extractTaskSummary(text: string): string {
+  // Get first 60 chars or first sentence, whichever is shorter
+  const firstSentence = text.split(/[.!?\n]/)[0] || text;
+  const summary = firstSentence.slice(0, 60);
+  return summary.length < firstSentence.length ? summary + "..." : summary;
 }
 
 // ============================================================================
@@ -242,6 +156,7 @@ function getState(sessionKey: string): SessionState {
   if (!sessionStates.has(sessionKey)) {
     sessionStates.set(sessionKey, {
       currentModel: null,
+      currentBeadId: null,
       needsReturnAnnouncement: false,
       pendingApproval: false,
     });
@@ -250,10 +165,109 @@ function getState(sessionKey: string): SessionState {
 }
 
 // ============================================================================
+// Model State File Management
+// ============================================================================
+
+function getModelStatePath(workspaceDir: string): string {
+  return join(workspaceDir, MODEL_STATE_FILE);
+}
+
+function loadModelState(workspaceDir: string): ModelStateFile {
+  const path = getModelStatePath(workspaceDir);
+  try {
+    if (existsSync(path)) {
+      return JSON.parse(readFileSync(path, "utf-8"));
+    }
+  } catch (e) {
+    // Ignore parse errors, return empty state
+  }
+  return { activeEscalations: [] };
+}
+
+function saveModelState(workspaceDir: string, state: ModelStateFile): void {
+  const path = getModelStatePath(workspaceDir);
+  const dir = dirname(path);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(path, JSON.stringify(state, null, 2));
+}
+
+function addEscalation(
+  workspaceDir: string,
+  entry: ModelStateEntry
+): void {
+  const state = loadModelState(workspaceDir);
+  // Remove any existing entry for this bead
+  state.activeEscalations = state.activeEscalations.filter(
+    (e) => e.beadId !== entry.beadId
+  );
+  state.activeEscalations.push(entry);
+  saveModelState(workspaceDir, state);
+}
+
+function removeEscalation(workspaceDir: string, beadId: string): ModelStateEntry | null {
+  const state = loadModelState(workspaceDir);
+  const entry = state.activeEscalations.find((e) => e.beadId === beadId);
+  if (entry) {
+    state.activeEscalations = state.activeEscalations.filter(
+      (e) => e.beadId !== beadId
+    );
+    saveModelState(workspaceDir, state);
+  }
+  return entry || null;
+}
+
+function getEscalationByBead(workspaceDir: string, beadId: string): ModelStateEntry | null {
+  const state = loadModelState(workspaceDir);
+  return state.activeEscalations.find((e) => e.beadId === beadId) || null;
+}
+
+// ============================================================================
+// Beads Integration
+// ============================================================================
+
+function createBead(workspaceDir: string, title: string, category: TaskCategory): string | null {
+  try {
+    const priorityMap: Record<TaskCategory, number> = {
+      "simple": 3,
+      "moderate": 2,
+      "coding": 1,
+      "complex": 0,
+      "security-audit": 0,
+    };
+    const priority = priorityMap[category] ?? 2;
+    
+    const result = execSync(
+      `cd "${workspaceDir}" && bd create "${title}" -p ${priority} --json 2>/dev/null`,
+      { encoding: "utf-8" }
+    );
+    
+    const parsed = JSON.parse(result);
+    return parsed.id || parsed.ID || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function closeBead(workspaceDir: string, beadId: string): boolean {
+  try {
+    execSync(`cd "${workspaceDir}" && bd close ${beadId} 2>/dev/null`);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ============================================================================
 // Injection Builders
 // ============================================================================
 
-function buildSuggestionInjection(category: TaskCategory, model: string, fallbacks: string[]): string {
+function buildSuggestionInjection(
+  category: TaskCategory,
+  model: string,
+  fallbacks: string[]
+): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
     moderate: "research/analysis",
@@ -278,14 +292,19 @@ function buildSuggestionInjection(category: TaskCategory, model: string, fallbac
     `3. Suggest the model: "This is ${categoryLabels[category]}, so I suggest ${model}"`,
     `4. Wait for user approval in one shot (they can validate task + model together)`,
     ``,
-    "Approval keywords: 'go ahead', 'proceed', 'yes', 'approve'",
+    "Approval keywords: 'go ahead', 'proceed', 'yes', 'approve', 'do it'",
     "Override keywords: 'stay on', 'keep', 'no switch'",
     "",
-    `5. Once approved: call session_status({ model: "${model}" }) then plan + execute`,
+    `5. Once approved: switch model, create bead to track work, then plan + execute`,
   ].join("\n");
 }
 
-function buildSwitchInjection(category: TaskCategory, model: string, fallbacks: string[]): string {
+function buildSwitchInjection(
+  category: TaskCategory,
+  model: string,
+  beadId: string,
+  fallbacks: string[]
+): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
     moderate: "research/analysis",
@@ -294,31 +313,29 @@ function buildSwitchInjection(category: TaskCategory, model: string, fallbacks: 
     "security-audit": "security/code audit",
   };
 
-  const fallbackNote = fallbacks.length > 0
-    ? `Fallbacks if needed: ${fallbacks.join(", ")}`
-    : "No fallbacks configured";
-
   return [
-    "MODEL ROUTING (auto-switch):",
+    "MODEL ROUTING (approved - switching):",
     `Task: ${categoryLabels[category]}`,
     `Switching to: ${model}`,
-    fallbackNote,
+    `Tracking bead: ${beadId}`,
     "",
     "INSTRUCTIONS:",
-    `- Call session_status({ model: "${model}" }) immediately`,
-    `- Briefly note: "⚡ ${model} for ${categoryLabels[category]}"`,
-    `- Then proceed with the task`,
+    `1. Call session_status({ model: "${model}" }) to switch`,
+    `2. Note: "⚡ ${model} for ${categoryLabels[category]} (tracking: ${beadId})"`,
+    `3. Proceed with the task`,
+    `4. When complete, run: bd close ${beadId}`,
+    `   This will auto-switch back to default if still on ${model}`,
   ].join("\n");
 }
 
-function buildReturnToDefaultInjection(): string {
+function buildReturnToDefaultInjection(beadId: string): string {
   return [
-    "MODEL ROUTING (auto-return):",
-    "Task complete — returning to default model.",
+    "MODEL ROUTING (bead closed - returning to default):",
+    `Bead ${beadId} closed — switching back to default model.`,
     "",
     "INSTRUCTIONS:",
     `- Call session_status({ model: "default" })`,
-    `- Note: "⚡ Back to default model"`,
+    `- Note: "⚡ Back to default model (${beadId} complete)"`,
   ].join("\n");
 }
 
@@ -329,7 +346,7 @@ function buildReturnToDefaultInjection(): string {
 const plugin = {
   id: "openclaw-model-selector",
   name: "Model Selector",
-  description: "Auto-switching model routing with fallbacks per task category",
+  description: "Auto-switching model routing with Beads integration",
   kind: "extension",
   configSchema: emptyPluginConfigSchema(),
 
@@ -339,12 +356,17 @@ const plugin = {
       ...(api.pluginConfig as ModelSelectorConfig),
     };
 
+    // Get workspace dir from config or env
+    const workspaceDir = cfg.workspaceDir || 
+      process.env.OPENCLAW_WORKSPACE || 
+      process.env.HOME + "/.openclaw/workspace";
+
     if (cfg.enabled === false) {
       api.logger.info("[model-selector] Disabled via config");
       return;
     }
 
-    api.logger.info(`[model-selector] Registered (auto-switch mode)`);
+    api.logger.info(`[model-selector] Registered v6 (Beads integration)`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -355,11 +377,13 @@ const plugin = {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey);
 
-        // Check if we need to return to default (after task completion)
-        if (state.needsReturnAnnouncement) {
-          api.logger.info(`[model-selector] Returning to default model`);
-          const injection = buildReturnToDefaultInjection();
+        // Check if we need to return to default
+        if (state.needsReturnAnnouncement && state.currentBeadId) {
+          api.logger.info(`[model-selector] Returning to default (bead: ${state.currentBeadId})`);
+          const injection = buildReturnToDefaultInjection(state.currentBeadId);
           state.needsReturnAnnouncement = false;
+          state.currentBeadId = null;
+          state.currentModel = null;
           return { prependContext: injection };
         }
 
@@ -378,55 +402,74 @@ const plugin = {
 
         // Handle pending approval
         if (state.pendingApproval && state.suggestedModel) {
-          // Check for approval or override
           const t = userText.toLowerCase();
           const approves = ["go ahead", "proceed", "yes", "yep", "approve", "ok", "do it", "lgtm"];
           const overrides = ["stay on", "stay with", "keep current", "no switch", "use default"];
 
           if (approves.some((a) => t.includes(a))) {
-            api.logger.info(
-              `[model-selector] Approval detected for ${state.suggestedModel}`,
-            );
+            api.logger.info(`[model-selector] Approval for ${state.suggestedModel}`);
+            
+            // Create bead to track this work
+            const taskSummary = state.suggestedTaskSummary || "Task";
+            const beadId = createBead(workspaceDir, taskSummary, state.suggestedCategory!);
+            
+            if (beadId) {
+              // Store escalation mapping
+              addEscalation(workspaceDir, {
+                beadId,
+                model: state.suggestedModel,
+                category: state.suggestedCategory!,
+                createdAt: new Date().toISOString(),
+                sessionKey,
+              });
+              
+              state.currentBeadId = beadId;
+              api.logger.info(`[model-selector] Created bead ${beadId}`);
+            }
+
             const injection = buildSwitchInjection(
               state.suggestedCategory!,
               state.suggestedModel,
+              beadId || "unknown",
               state.suggestedFallbacks || [],
             );
+            
             state.currentModel = state.suggestedModel;
             state.pendingApproval = false;
             state.suggestedModel = undefined;
             state.suggestedCategory = undefined;
             state.suggestedFallbacks = undefined;
+            state.suggestedTaskSummary = undefined;
+            
             return { prependContext: injection };
           }
 
           if (overrides.some((o) => t.includes(o))) {
-            api.logger.info(`[model-selector] Override detected — staying on current model`);
+            api.logger.info(`[model-selector] Override — staying on current model`);
             state.pendingApproval = false;
             state.suggestedModel = undefined;
             state.suggestedCategory = undefined;
             state.suggestedFallbacks = undefined;
-            return; // Don't inject anything, just proceed on current model
+            state.suggestedTaskSummary = undefined;
+            return;
           }
 
-          // Still waiting for approval, don't process this message as a new task
+          // Still waiting for approval
           return;
         }
 
-        // Classify the incoming message
+        // Classify incoming message
         const category = classifyTask(userText);
 
-        // If simple, no suggestion needed
         if (category === "simple") {
           return;
         }
 
-        // Get model for this category
         const modelList = getModelList(category, cfg);
         const primaryModel = modelList[0];
 
         if (!primaryModel) {
-          return; // No models configured for this category
+          return;
         }
 
         // Don't re-suggest if already on this model
@@ -439,6 +482,7 @@ const plugin = {
         state.suggestedModel = primaryModel;
         state.suggestedCategory = category;
         state.suggestedFallbacks = modelList.slice(1);
+        state.suggestedTaskSummary = extractTaskSummary(userText);
         state.pendingApproval = true;
 
         const injection = buildSuggestionInjection(
@@ -452,22 +496,46 @@ const plugin = {
     );
 
     // ========================================================================
-    // Hook: after_tool_call (detect Todoist task completion)
+    // Hook: after_tool_call (detect bd close)
     // ========================================================================
     api.on(
       "after_tool_call",
       async (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => {
-        // Check if this was a complete-tasks call (Todoist via mcporter)
-        if (event.toolName !== "complete-tasks") return;
-
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey);
 
-        // If we're on an upgraded model, queue a return to default
-        if (state.currentModel !== null) {
-          api.logger.info(`[model-selector] Task completed — queuing return to default`);
-          state.currentModel = null;
-          state.needsReturnAnnouncement = true;
+        // Check for exec calls that might be bd close
+        if (event.toolName === "exec") {
+          const args = event.args as { command?: string } | undefined;
+          const command = args?.command || "";
+          
+          // Match: bd close <bead-id>
+          const closeMatch = command.match(/\bbd\s+close\s+(\S+)/);
+          if (closeMatch) {
+            const beadId = closeMatch[1];
+            api.logger.info(`[model-selector] Detected bd close ${beadId}`);
+            
+            // Check if this bead has an associated model escalation
+            const escalation = getEscalationByBead(workspaceDir, beadId);
+            
+            if (escalation) {
+              // Remove from active escalations
+              removeEscalation(workspaceDir, beadId);
+              
+              // Check if we're still on that model
+              if (state.currentModel === escalation.model) {
+                api.logger.info(
+                  `[model-selector] Bead ${beadId} closed, current model matches — queuing return to default`
+                );
+                state.needsReturnAnnouncement = true;
+                state.currentBeadId = beadId;
+              } else {
+                api.logger.info(
+                  `[model-selector] Bead ${beadId} closed, but model changed (${state.currentModel} != ${escalation.model}) — no switch`
+                );
+              }
+            }
+          }
         }
       },
       { priority: 50 },

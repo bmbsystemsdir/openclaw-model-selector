@@ -1,6 +1,6 @@
 {
   "name": "openclaw-model-selector",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "type": "module",
   "description": "Automatic per-turn model selection for OpenClaw (simple chat vs complex orchestration vs coding)",
   "license": "MIT",
