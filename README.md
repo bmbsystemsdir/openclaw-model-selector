@@ -1,59 +1,64 @@
 # openclaw-model-selector
 
-Approval-first model routing for OpenClaw with fallbacks.
+Hybrid task classification with approval-first model routing for OpenClaw.
 
 ## What it does
-1. **Classify** the task and suggest the best model
-2. **Wait for approval** (you approve or override)
-3. **Switch** to the approved model, then plan + execute on that model
-4. **Fall back** through model list if primary unavailable
-5. **Return to default** when Todoist task completes
+
+1. **Classify** incoming message (keyword matching + Gemini LLM fallback)
+2. **Suggest** the best model for the task
+3. **Wait for approval** (you approve or override)
+4. **Switch** to the approved model, then execute
+5. **Announce and switch back** when task complete (opt-out override)
 
 ## Why approval first?
 
 Planning + execution should happen on the *right* model, not on haiku (default). If I auto-switch without approval, I analyze on haiku, then switch—you lose planning quality on the better model.
 
 **Flow:**
-- Request arrives → I classify it on haiku (quick)
-- I suggest a model with reasoning
-- **You approve**
-- Then I switch to that model
-- Then I do planning + execution on that model (the important parts)
+- Request arrives → classify (keyword match or LLM fallback)
+- Suggest a model with reasoning
+- **You approve** ("go ahead", "yes", "do it")
+- Switch to that model
+- Execute on that model
+- When done: announce "Switching back to haiku" → switch (you can say "no" to stay)
+
+## Classification
+
+**Fast path:** Keyword matching (instant, free)
+- Coding: `code me`, `implement`, `debug`, `write a script`, etc.
+- Complex: `architect`, `system design`, `build the`, etc.
+- Moderate: `research`, `analyze`, `draft`, `summarize`, etc.
+- Security: `security review`, `code audit`, `find vulnerabilities`, etc.
+
+**Fallback:** Gemini 2.0 Flash LLM classification
+- Triggers for messages >50 chars without keyword match
+- ~100 tokens, ~$0.0001/call
 
 ## Categories & Models
 
 | Category | Primary | Fallbacks | Triggers |
 |----------|---------|-----------|----------|
-| **simple** | (haiku) | — | No triggers → stays on default |
-| **moderate** | sonnet | gemini-flash | research, analyze, draft, write, data review, academic |
-| **coding** | opus | sonnet, gemini-flash | code fences, implement, debug, refactor, script |
-| **complex** | opus | gemini-pro | orchestrate, architect, system design, migrate, multi-step |
-| **security-audit** | gpt-5.2 | opus | code review, security review, find vulnerabilities, audit code |
+| **simple** | (default) | — | No triggers → stays on default |
+| **moderate** | sonnet | gemini-flash | research, analyze, draft, write, academic |
+| **coding** | opus | sonnet, gemini-flash | code, implement, debug, script |
+| **complex** | opus | gemini-pro | orchestrate, architect, system design |
+| **security-audit** | gpt-5.2 | opus | code review, security review, audit |
 
-## Approval Triggers
+## Approval Keywords
 
-**Approve the suggestion:**
-- "go ahead", "proceed", "yes", "approve", "do it", "ok"
+**Approve:** `go ahead`, `proceed`, `yes`, `approve`, `do it`, `ok`, `lgtm`
 
-**Override (stay on default):**
-- "stay on", "stay with", "keep", "no switch", "use default"
+**Override (stay on default):** `stay on`, `keep`, `no switch`
 
-## Model Tiers (2026)
-
-| Tier | Models | Best For |
-|------|--------|----------|
-| **Efficiency** | Haiku, Gemini Flash | High-volume, real-time, quick tasks |
-| **Performance** | Sonnet, Gemini Pro | Daily driver, general work, coding partners |
-| **Frontier** | Opus, GPT 5.2 | Deep reasoning, architecture, security audits |
+**Stay on upgraded model (after task):** `no`, `not done`, `keep going`
 
 ## Config
 
-Models are easy to update as new versions release:
+Place in `config/model-selector.json` in your workspace:
 
 ```json
 {
   "enabled": true,
-  "announceSwitch": true,
   "models": {
     "simple": [],
     "moderate": ["sonnet", "gemini-flash"],
@@ -64,17 +69,14 @@ Models are easy to update as new versions release:
 }
 ```
 
-To swap models, just edit the arrays. First model = primary, rest = fallbacks.
+First model = primary, rest = fallbacks.
 
-## Todoist Integration
+## Requirements
 
-When `complete-tasks` is called (via mcporter), the plugin:
-1. Detects task completion
-2. Queues return to default model
-3. Next turn: injects instructions to call `session_status({ model: "default" })`
+- `GEMINI_API_KEY` env var for LLM fallback classification (optional but recommended)
 
 ## Install
 
 ```bash
-openclaw plugins install --link /path/to/openclaw-model-selector
+openclaw plugins install /path/to/openclaw-model-selector
 ```
