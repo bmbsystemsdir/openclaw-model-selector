@@ -1,12 +1,11 @@
 /**
- * OpenClaw Model Selector Plugin v7
+ * OpenClaw Model Selector Plugin v8
  *
  * Hybrid classification: keyword matching + Gemini LLM fallback.
- * Approval-first model routing with Beads integration:
+ * Approval-first model routing with announce-and-switch completion:
  * - Classify task + suggest best model (wait for approval)
- * - User approves → create bead + switch to approved model
- * - Plan + execute on upgraded model
- * - On bead close: if still on that model, switch back to default
+ * - User approves → switch to approved model
+ * - Agent completes task → announces switch-back and switches (opt-out override)
  *
  * Categories:
  * - simple: stays on default (haiku)
@@ -20,13 +19,10 @@ import type {
   OpenClawPluginApi,
   PluginHookBeforeAgentStartEvent,
   PluginHookAgentContext,
-  PluginHookAfterToolCallEvent,
-  PluginHookToolContext,
 } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { execSync } from "child_process";
-import { join, dirname } from "path";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
 
 // ============================================================================
 // LLM Classification Fallback
@@ -96,8 +92,6 @@ type TaskCategory = "simple" | "moderate" | "coding" | "complex" | "security-aud
 
 interface ModelSelectorConfig {
   enabled?: boolean;
-  announceSwitch?: boolean;
-  workspaceDir?: string;
   models?: {
     simple?: string[];
     moderate?: string[];
@@ -109,34 +103,18 @@ interface ModelSelectorConfig {
 
 interface SessionState {
   currentModel: string | null; // null = on default model
-  currentBeadId: string | null; // bead tracking this work
-  needsReturnAnnouncement: boolean;
-  suggestedModel?: string; // Pending approval
+  suggestedModel?: string;
   suggestedCategory?: TaskCategory;
   suggestedFallbacks?: string[];
-  suggestedTaskSummary?: string;
   pendingApproval: boolean;
-}
-
-interface ModelStateEntry {
-  beadId: string;
-  model: string;
-  category: TaskCategory;
-  createdAt: string;
-  sessionKey: string;
-}
-
-interface ModelStateFile {
-  activeEscalations: ModelStateEntry[];
 }
 
 // ============================================================================
 // Defaults
 // ============================================================================
 
-const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled" | "workspaceDir">> & { enabled: boolean } = {
+const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled">> & { enabled: boolean } = {
   enabled: true,
-  announceSwitch: true,
   models: {
     simple: [],
     moderate: ["sonnet", "gemini-flash"],
@@ -145,8 +123,6 @@ const DEFAULT_CONFIG: Required<Omit<ModelSelectorConfig, "enabled" | "workspaceD
     "security-audit": ["openai-codex/gpt-5.2", "opus"],
   },
 };
-
-const MODEL_STATE_FILE = ".beads/model-state.json";
 
 // ============================================================================
 // Classification Signals
@@ -195,7 +171,7 @@ function classifyTaskKeywords(text: string): TaskCategory | null {
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
   if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
   if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
-  return null; // No keyword match
+  return null;
 }
 
 async function classifyTask(
@@ -221,7 +197,6 @@ async function classifyTask(
     return llmResult;
   }
 
-  // Default to simple if LLM fails
   return "simple";
 }
 
@@ -229,13 +204,6 @@ function getModelList(category: TaskCategory, cfg: ModelSelectorConfig): string[
   const models = cfg.models ?? DEFAULT_CONFIG.models;
   const categoryModels = models[category] ?? DEFAULT_CONFIG.models[category];
   return Array.isArray(categoryModels) ? categoryModels : [];
-}
-
-function extractTaskSummary(text: string): string {
-  // Get first 60 chars or first sentence, whichever is shorter
-  const firstSentence = text.split(/[.!?\n]/)[0] || text;
-  const summary = firstSentence.slice(0, 60);
-  return summary.length < firstSentence.length ? summary + "..." : summary;
 }
 
 // ============================================================================
@@ -248,107 +216,10 @@ function getState(sessionKey: string): SessionState {
   if (!sessionStates.has(sessionKey)) {
     sessionStates.set(sessionKey, {
       currentModel: null,
-      currentBeadId: null,
-      needsReturnAnnouncement: false,
       pendingApproval: false,
     });
   }
   return sessionStates.get(sessionKey)!;
-}
-
-// ============================================================================
-// Model State File Management
-// ============================================================================
-
-function getModelStatePath(workspaceDir: string): string {
-  return join(workspaceDir, MODEL_STATE_FILE);
-}
-
-function loadModelState(workspaceDir: string): ModelStateFile {
-  const path = getModelStatePath(workspaceDir);
-  try {
-    if (existsSync(path)) {
-      return JSON.parse(readFileSync(path, "utf-8"));
-    }
-  } catch (e) {
-    // Ignore parse errors, return empty state
-  }
-  return { activeEscalations: [] };
-}
-
-function saveModelState(workspaceDir: string, state: ModelStateFile): void {
-  const path = getModelStatePath(workspaceDir);
-  const dir = dirname(path);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-  writeFileSync(path, JSON.stringify(state, null, 2));
-}
-
-function addEscalation(
-  workspaceDir: string,
-  entry: ModelStateEntry
-): void {
-  const state = loadModelState(workspaceDir);
-  // Remove any existing entry for this bead
-  state.activeEscalations = state.activeEscalations.filter(
-    (e) => e.beadId !== entry.beadId
-  );
-  state.activeEscalations.push(entry);
-  saveModelState(workspaceDir, state);
-}
-
-function removeEscalation(workspaceDir: string, beadId: string): ModelStateEntry | null {
-  const state = loadModelState(workspaceDir);
-  const entry = state.activeEscalations.find((e) => e.beadId === beadId);
-  if (entry) {
-    state.activeEscalations = state.activeEscalations.filter(
-      (e) => e.beadId !== beadId
-    );
-    saveModelState(workspaceDir, state);
-  }
-  return entry || null;
-}
-
-function getEscalationByBead(workspaceDir: string, beadId: string): ModelStateEntry | null {
-  const state = loadModelState(workspaceDir);
-  return state.activeEscalations.find((e) => e.beadId === beadId) || null;
-}
-
-// ============================================================================
-// Beads Integration
-// ============================================================================
-
-function createBead(workspaceDir: string, title: string, category: TaskCategory): string | null {
-  try {
-    const priorityMap: Record<TaskCategory, number> = {
-      "simple": 3,
-      "moderate": 2,
-      "coding": 1,
-      "complex": 0,
-      "security-audit": 0,
-    };
-    const priority = priorityMap[category] ?? 2;
-    
-    const result = execSync(
-      `cd "${workspaceDir}" && bd create "${title}" -p ${priority} --json 2>/dev/null`,
-      { encoding: "utf-8" }
-    );
-    
-    const parsed = JSON.parse(result);
-    return parsed.id || parsed.ID || null;
-  } catch (e) {
-    return null;
-  }
-}
-
-function closeBead(workspaceDir: string, beadId: string): boolean {
-  try {
-    execSync(`cd "${workspaceDir}" && bd close ${beadId} 2>/dev/null`);
-    return true;
-  } catch (e) {
-    return false;
-  }
 }
 
 // ============================================================================
@@ -380,22 +251,18 @@ function buildSuggestionInjection(
     "",
     "INSTRUCTIONS (all in one response):",
     `1. Restate your understanding: "I understand you want to..."`,
-    `2. Ask clarifying questions if needed: "Quick question: ...?"`,
+    `2. Ask clarifying questions if needed`,
     `3. Suggest the model: "This is ${categoryLabels[category]}, so I suggest ${model}"`,
-    `4. Wait for user approval in one shot (they can validate task + model together)`,
-    ``,
+    `4. Wait for user approval`,
+    "",
     "Approval keywords: 'go ahead', 'proceed', 'yes', 'approve', 'do it'",
     "Override keywords: 'stay on', 'keep', 'no switch'",
-    "",
-    `5. Once approved: switch model, create bead to track work, then plan + execute`,
   ].join("\n");
 }
 
 function buildSwitchInjection(
   category: TaskCategory,
-  model: string,
-  beadId: string,
-  fallbacks: string[]
+  model: string
 ): string {
   const categoryLabels: Record<TaskCategory, string> = {
     simple: "simple task",
@@ -409,25 +276,14 @@ function buildSwitchInjection(
     "MODEL ROUTING (approved - switching):",
     `Task: ${categoryLabels[category]}`,
     `Switching to: ${model}`,
-    `Tracking bead: ${beadId}`,
     "",
     "INSTRUCTIONS:",
     `1. Call session_status({ model: "${model}" }) to switch`,
-    `2. Note: "⚡ ${model} for ${categoryLabels[category]} (tracking: ${beadId})"`,
+    `2. Note: "⚡ Switching to ${model} for ${categoryLabels[category]}"`,
     `3. Proceed with the task`,
-    `4. When complete, run: bd close ${beadId}`,
-    `   This will auto-switch back to default if still on ${model}`,
-  ].join("\n");
-}
-
-function buildReturnToDefaultInjection(beadId: string): string {
-  return [
-    "MODEL ROUTING (bead closed - returning to default):",
-    `Bead ${beadId} closed — switching back to default model.`,
-    "",
-    "INSTRUCTIONS:",
-    `- Call session_status({ model: "default" })`,
-    `- Note: "⚡ Back to default model (${beadId} complete)"`,
+    `4. When complete: announce "Done. Switching back to haiku." then call session_status({ model: "default" })`,
+    `   - User can say "no" / "not done" / "keep going" to stay on ${model}`,
+    `   - Silence = proceed with switch-back`,
   ].join("\n");
 }
 
@@ -438,16 +294,15 @@ function buildReturnToDefaultInjection(beadId: string): string {
 const plugin = {
   id: "openclaw-model-selector",
   name: "Model Selector",
-  description: "Auto-switching model routing with Beads integration",
+  description: "Hybrid classification with announce-and-switch completion",
   kind: "extension",
   configSchema: emptyPluginConfigSchema(),
 
   register(api: OpenClawPluginApi) {
-    // Get workspace dir from env
     const workspaceDir = process.env.OPENCLAW_WORKSPACE || 
       process.env.HOME + "/.openclaw/workspace";
     
-    // Load config from workspace file (not openclaw.json)
+    // Load config
     const configPath = join(workspaceDir, "config/model-selector.json");
     let rawCfg: ModelSelectorConfig = {};
     
@@ -462,7 +317,6 @@ const plugin = {
     
     const cfg: ModelSelectorConfig = {
       enabled: rawCfg?.enabled ?? DEFAULT_CONFIG.enabled,
-      announceSwitch: rawCfg?.announceSwitch ?? DEFAULT_CONFIG.announceSwitch,
       models: {
         simple: rawCfg?.models?.simple ?? DEFAULT_CONFIG.models.simple,
         moderate: rawCfg?.models?.moderate ?? DEFAULT_CONFIG.models.moderate,
@@ -477,7 +331,7 @@ const plugin = {
       return;
     }
 
-    api.logger.info(`[model-selector] Registered v7 (Hybrid classification + Beads)`);
+    api.logger.info(`[model-selector] Registered v8 (Hybrid + announce-and-switch)`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -487,16 +341,6 @@ const plugin = {
       async (event: PluginHookBeforeAgentStartEvent, ctx: PluginHookAgentContext) => {
         const sessionKey = ctx.sessionKey ?? "unknown";
         const state = getState(sessionKey);
-
-        // Check if we need to return to default
-        if (state.needsReturnAnnouncement && state.currentBeadId) {
-          api.logger.info(`[model-selector] Returning to default (bead: ${state.currentBeadId})`);
-          const injection = buildReturnToDefaultInjection(state.currentBeadId);
-          state.needsReturnAnnouncement = false;
-          state.currentBeadId = null;
-          state.currentModel = null;
-          return { prependContext: injection };
-        }
 
         // Extract last user message
         const msgs = event.messages as Array<{ role?: string; content?: unknown }> | undefined;
@@ -520,29 +364,9 @@ const plugin = {
           if (approves.some((a) => t.includes(a))) {
             api.logger.info(`[model-selector] Approval for ${state.suggestedModel}`);
             
-            // Create bead to track this work
-            const taskSummary = state.suggestedTaskSummary || "Task";
-            const beadId = createBead(workspaceDir, taskSummary, state.suggestedCategory!);
-            
-            if (beadId) {
-              // Store escalation mapping
-              addEscalation(workspaceDir, {
-                beadId,
-                model: state.suggestedModel,
-                category: state.suggestedCategory!,
-                createdAt: new Date().toISOString(),
-                sessionKey,
-              });
-              
-              state.currentBeadId = beadId;
-              api.logger.info(`[model-selector] Created bead ${beadId}`);
-            }
-
             const injection = buildSwitchInjection(
               state.suggestedCategory!,
-              state.suggestedModel,
-              beadId || "unknown",
-              state.suggestedFallbacks || [],
+              state.suggestedModel
             );
             
             state.currentModel = state.suggestedModel;
@@ -550,7 +374,6 @@ const plugin = {
             state.suggestedModel = undefined;
             state.suggestedCategory = undefined;
             state.suggestedFallbacks = undefined;
-            state.suggestedTaskSummary = undefined;
             
             return { prependContext: injection };
           }
@@ -561,11 +384,10 @@ const plugin = {
             state.suggestedModel = undefined;
             state.suggestedCategory = undefined;
             state.suggestedFallbacks = undefined;
-            state.suggestedTaskSummary = undefined;
             return;
           }
 
-          // Still waiting for approval
+          // Still waiting for approval - don't re-suggest
           return;
         }
 
@@ -593,63 +415,16 @@ const plugin = {
         state.suggestedModel = primaryModel;
         state.suggestedCategory = category;
         state.suggestedFallbacks = modelList.slice(1);
-        state.suggestedTaskSummary = extractTaskSummary(userText);
         state.pendingApproval = true;
 
         const injection = buildSuggestionInjection(
           category,
           primaryModel,
-          state.suggestedFallbacks,
+          state.suggestedFallbacks
         );
         return { prependContext: injection };
       },
-      { priority: 50 },
-    );
-
-    // ========================================================================
-    // Hook: after_tool_call (detect bd close)
-    // ========================================================================
-    api.on(
-      "after_tool_call",
-      async (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => {
-        const sessionKey = ctx.sessionKey ?? "unknown";
-        const state = getState(sessionKey);
-
-        // Check for exec calls that might be bd close
-        if (event.toolName === "exec") {
-          const args = event.args as { command?: string } | undefined;
-          const command = args?.command || "";
-          
-          // Match: bd close <bead-id>
-          const closeMatch = command.match(/\bbd\s+close\s+(\S+)/);
-          if (closeMatch) {
-            const beadId = closeMatch[1];
-            api.logger.info(`[model-selector] Detected bd close ${beadId}`);
-            
-            // Check if this bead has an associated model escalation
-            const escalation = getEscalationByBead(workspaceDir, beadId);
-            
-            if (escalation) {
-              // Remove from active escalations
-              removeEscalation(workspaceDir, beadId);
-              
-              // Check if we're still on that model
-              if (state.currentModel === escalation.model) {
-                api.logger.info(
-                  `[model-selector] Bead ${beadId} closed, current model matches — queuing return to default`
-                );
-                state.needsReturnAnnouncement = true;
-                state.currentBeadId = beadId;
-              } else {
-                api.logger.info(
-                  `[model-selector] Bead ${beadId} closed, but model changed (${state.currentModel} != ${escalation.model}) — no switch`
-                );
-              }
-            }
-          }
-        }
-      },
-      { priority: 50 },
+      { priority: 50 }
     );
 
     // ========================================================================
