@@ -1,6 +1,7 @@
 /**
- * OpenClaw Model Selector Plugin v6
+ * OpenClaw Model Selector Plugin v7
  *
+ * Hybrid classification: keyword matching + Gemini LLM fallback.
  * Approval-first model routing with Beads integration:
  * - Classify task + suggest best model (wait for approval)
  * - User approves → create bead + switch to approved model
@@ -26,6 +27,66 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join, dirname } from "path";
+
+// ============================================================================
+// LLM Classification Fallback
+// ============================================================================
+
+const CLASSIFICATION_PROMPT = `Classify this user message into exactly one category. Reply with ONLY the category name, nothing else.
+
+Categories:
+- simple: casual chat, quick questions, acknowledgments, greetings
+- moderate: research, analysis, writing, summarization, explanation requests
+- coding: programming, scripts, debugging, technical implementation
+- complex: system design, architecture, multi-step projects, orchestration
+- security-audit: security review, vulnerability assessment, code audit
+
+Message: "{MESSAGE}"
+
+Category:`;
+
+async function classifyWithLLM(text: string, logger: { info: (msg: string) => void }): Promise<TaskCategory | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    logger.info("[model-selector] No GEMINI_API_KEY for LLM fallback");
+    return null;
+  }
+
+  try {
+    const prompt = CLASSIFICATION_PROMPT.replace("{MESSAGE}", text.slice(0, 500));
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 10, temperature: 0 },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      logger.info(`[model-selector] LLM fallback failed: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const result = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toLowerCase();
+    
+    const validCategories: TaskCategory[] = ["simple", "moderate", "coding", "complex", "security-audit"];
+    if (result && validCategories.includes(result as TaskCategory)) {
+      logger.info(`[model-selector] LLM classified as: ${result}`);
+      return result as TaskCategory;
+    }
+    
+    logger.info(`[model-selector] LLM returned invalid category: ${result}`);
+    return null;
+  } catch (e) {
+    logger.info(`[model-selector] LLM fallback error: ${e}`);
+    return null;
+  }
+}
 
 // ============================================================================
 // Types
@@ -103,6 +164,10 @@ const CODING_SIGNALS = [
   "typescript", "javascript", "python", "bash", "sql", "api endpoint",
   "unit test", "pull request", "stack trace", "error:", "exception",
   "function", "class", "module",
+  // Expanded patterns
+  "code me", "code this", "code a", "build me", "build a", "create a",
+  "make me a", "program", "script to", "automate", "cli tool", "bot",
+  "webhook", "integration", "parse", "generate code",
 ];
 
 const COMPLEX_SIGNALS = [
@@ -124,12 +189,39 @@ const MODERATE_SIGNALS = [
   "hebrew", "theological", "doctrine", "scripture",
 ];
 
-function classifyTask(text: string): TaskCategory {
+function classifyTaskKeywords(text: string): TaskCategory | null {
   const t = text.toLowerCase();
   if (SECURITY_AUDIT_SIGNALS.some((s) => t.includes(s))) return "security-audit";
   if (COMPLEX_SIGNALS.some((s) => t.includes(s))) return "complex";
   if (CODING_SIGNALS.some((s) => t.includes(s))) return "coding";
   if (MODERATE_SIGNALS.some((s) => t.includes(s))) return "moderate";
+  return null; // No keyword match
+}
+
+async function classifyTask(
+  text: string,
+  logger: { info: (msg: string) => void }
+): Promise<TaskCategory> {
+  // Fast path: keyword matching
+  const keywordResult = classifyTaskKeywords(text);
+  if (keywordResult) {
+    logger.info(`[model-selector] Keyword match: ${keywordResult}`);
+    return keywordResult;
+  }
+
+  // Skip LLM for short messages (likely simple)
+  if (text.length < 50) {
+    return "simple";
+  }
+
+  // Fallback: LLM classification for ambiguous messages
+  logger.info("[model-selector] No keyword match, trying LLM fallback...");
+  const llmResult = await classifyWithLLM(text, logger);
+  if (llmResult) {
+    return llmResult;
+  }
+
+  // Default to simple if LLM fails
   return "simple";
 }
 
@@ -385,7 +477,7 @@ const plugin = {
       return;
     }
 
-    api.logger.info(`[model-selector] Registered v6 (Beads integration)`);
+    api.logger.info(`[model-selector] Registered v7 (Hybrid classification + Beads)`);
 
     // ========================================================================
     // Hook: before_agent_start
@@ -478,7 +570,7 @@ const plugin = {
         }
 
         // Classify incoming message
-        const category = classifyTask(userText);
+        const category = await classifyTask(userText, api.logger);
 
         if (category === "simple") {
           return;
