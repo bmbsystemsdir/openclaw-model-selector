@@ -42,9 +42,10 @@ Message: "{MESSAGE}"
 Category:`;
 
 async function classifyWithLLM(text: string, logger: { info: (msg: string) => void }): Promise<TaskCategory | null> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Use dedicated key for classification, fall back to general key
+  const apiKey = process.env.GEMINI_CLASSIFICATION_KEY || process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    logger.info("[model-selector] No GEMINI_API_KEY for LLM fallback");
+    logger.info("[model-selector] No GEMINI_CLASSIFICATION_KEY or GEMINI_API_KEY for LLM fallback");
     return null;
   }
 

@@ -73,7 +73,9 @@ First model = primary, rest = fallbacks.
 
 ## Requirements
 
-- `GEMINI_API_KEY` env var for LLM fallback classification (optional but recommended)
+- `GEMINI_CLASSIFICATION_KEY` env var for LLM fallback classification (optional)
+- Falls back to `GEMINI_API_KEY` if `GEMINI_CLASSIFICATION_KEY` not set
+- Use a separate key to avoid sharing quota with embeddings
 
 ## Install
 
